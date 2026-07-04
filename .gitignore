@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+.env
+
+# Generated experiment artifacts. Keep result folders via .gitkeep files.
+results/figures/*.png
+results/tables/*.csv
+results/tables/*.md
+results/checkpoints/*.pt
+
+# Do not commit the source paper PDF.
+*.pdf
+
+# OS/editor noise.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

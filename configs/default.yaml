@@ -1,0 +1,87 @@
+seed: 7
+
+environment:
+  area_size: 400.0
+  max_depth: 120.0
+  num_uuvs: 3
+  dt: 1.0
+  max_steps: 100
+  uav_height: 120.0
+  uav_speed: 30.0
+  usv_speed: 4.0
+  uuv_speed: 8.0
+  uuv_vertical_speed: 4.0
+  target_speed: 3.0
+  initial_uuv_depth: 120.0
+  target_depth: 120.0
+  capture_radius: 18.0
+  uuv_search_radius: 18.0
+  escape_distance: 288.0
+  cooperative_capture_count: 2
+  sonar_radius: 130.0
+  uuv_acoustic_range: 700.0
+  usv_uuv_range: 700.0
+  uav_usv_range: 700.0
+  camera_fov_deg: 70.0
+  min_camera_radius: 120.0
+  uuv_energy_budget: 65000.0
+  reward:
+    capture: 120.0
+    cooperative_bonus: 25.0
+    distance_scale: 260.0
+    distance_weight: 1.0
+    energy_weight: 0.025
+    connectivity_weight: 2.5
+    observed_bonus: 0.4
+    step_penalty: 0.04
+    depleted_penalty: 80.0
+
+agent:
+  gamma: 0.95
+  learning_rate: 0.001
+  batch_size: 128
+  replay_capacity: 10000
+  hidden_dim: 128
+  target_update_interval: 100
+  epsilon: 0.9
+  epsilon_start: 0.9
+  epsilon_end: 0.05
+  epsilon_decay_steps: 2200
+  gradient_clip: 5.0
+  device: auto
+
+training:
+  episodes: 35
+  iterations: 100
+  eval_episodes: 6
+  table_variant_episodes: 12
+  progress_bar: true
+
+experiments:
+  heights: [80.0, 120.0, 160.0, 200.0, 240.0]
+  uuv_speeds: [6.0, 9.0, 12.0, 15.0, 18.0]
+  fig2:
+    heights_m: [50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0]
+    speeds_knots: [3.9, 7.8, 11.7, 15.6, 19.5, 23.4, 27.3]
+    dqn_train_episodes: 35
+    eval_episodes: 6
+  table2:
+    H: [50.0, 75.0, 100.0, 125.0]
+    train_episodes: 12
+    eval_episodes: 6
+  aco:
+    episodes: 8
+    grid_size: 25
+    ants: 100
+    iterations: 100
+    evaporation: 0.2
+    replan_interval: 10
+    alpha: 1.0
+    beta: 2.5
+    q: 80.0
+
+results:
+  root: results
+  figures: results/figures
+  tables: results/tables
+  checkpoints: results/checkpoints

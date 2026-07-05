@@ -6,6 +6,10 @@ implements a compact 3U simulator, energy and connectivity models, DQN-family
 controllers, an Ant Colony Optimization baseline, and experiment scripts for
 Fig. 2-like, Fig. 3-like, and Table II-like comparisons.
 
+The current version also includes a Lyapunov-inspired safety filter for UUV
+action selection. The filter is an educational one-step safety heuristic, not a
+formal proof of global stability.
+
 ## Paper Citation
 
 Wei Wei et al., "3U: Joint Design of UAV-USV-UUV Networks for Cooperative
@@ -34,6 +38,9 @@ reproduction-style simulation results, not as exact paper results.
   optional acoustic communication term.
 - Connectivity model: UAV-USV connectivity and underwater USV-UUV graph
   connectivity are approximated from distances.
+- Lyapunov-inspired safety filter: Candidate UUV actions are screened with a
+  scalar function that combines target distance, connectivity risk, energy
+  imbalance risk, and boundary risk.
 - DQN / Double DQN / Dueling DQN: PyTorch agents learn UUV group-center
   trajectory decisions.
 - ACO baseline: A grid-based Ant Colony Optimization planner provides a
@@ -66,12 +73,15 @@ reproduction-style simulation results, not as exact paper results.
 |   |   |-- replay_buffer.py
 |   |   |-- plotting.py
 |   |   `-- seed.py
+|   |-- safety/
+|   |   `-- lyapunov.py
 |   `-- experiments/
 |       |-- run_dqn.py
 |       |-- run_aco.py
 |       |-- compare_height.py
 |       |-- compare_speed.py
-|       `-- reproduce_table2.py
+|       |-- reproduce_table2.py
+|       `-- ablation_lyapunov.py
 |-- results/
 |   |-- figures/
 |   |-- tables/
@@ -108,6 +118,7 @@ Train or evaluate DQN-family agents:
 python src/experiments/run_dqn.py
 python src/experiments/run_dqn.py --agent double_dqn
 python src/experiments/run_dqn.py --agent dueling_dqn
+python src/experiments/run_dqn.py --no-lyapunov
 ```
 
 Run the ACO baseline:
@@ -127,6 +138,18 @@ Run the Table II-like reproduction:
 
 ```bash
 python src/experiments/reproduce_table2.py
+```
+
+Run the Lyapunov safety ablation:
+
+```bash
+python src/experiments/ablation_lyapunov.py
+```
+
+For a short smoke run of the main pipeline:
+
+```bash
+python src/main.py --config configs/default.yaml --episodes 5
 ```
 
 ## Outputs
@@ -157,6 +180,12 @@ Common outputs include:
 - `fig3_results.csv`
 - `table2_reproduction.csv`
 - `table2_reproduction.md`
+- `ablation_lyapunov.csv`
+
+The Lyapunov ablation also writes:
+
+- `lyapunov_curve.png`
+- `lyapunov_ablation.png`
 
 Model checkpoints are saved under:
 
@@ -173,6 +202,8 @@ results/checkpoints/
 - Exact numerical results may differ from the paper.
 - The ACO baseline is a standard grid-based approximation rather than an
   official baseline implementation.
+- The Lyapunov module is a one-step safety filter inspired by Lyapunov
+  decrease conditions. It is not a formal proof of global stability.
 
 ## Future Work
 

@@ -84,6 +84,8 @@ def _summarize(raw_df: pd.DataFrame, x_column: str) -> pd.DataFrame:
         avg_search_time=("search_time", "mean"),
         success_rate=("success", "mean"),
         avg_path_length=("path_length", "mean"),
+        avg_safety_violations=("safety_violations", "mean"),
+        avg_lyapunov_value=("avg_lyapunov_value", "mean"),
     )
 
 
@@ -92,6 +94,8 @@ def _summarize_distances(raw_df: pd.DataFrame, x_column: str) -> pd.DataFrame:
     return grouped.agg(
         avg_us_distance=("avg_us_distance", "mean"),
         avg_sg_distance=("avg_sg_distance", "mean"),
+        avg_connected_fraction=("avg_connected_fraction", "mean"),
+        avg_target_distance=("avg_target_distance", "mean"),
         avg_search_time=("search_time", "mean"),
         success_rate=("success", "mean"),
     )
@@ -186,6 +190,11 @@ def compare_uav_height(
                     "path_length": float(row["path_length"]),
                     "avg_us_distance": float(row["avg_us_distance"]),
                     "avg_sg_distance": float(row["avg_sg_distance"]),
+                    "avg_connected_fraction": float(row.get("avg_connected_fraction", row.get("connected_fraction", np.nan))),
+                    "avg_target_distance": float(row.get("avg_target_distance", row.get("mean_target_distance", np.nan))),
+                    "avg_lyapunov_value": float(row.get("avg_lyapunov_value", np.nan)),
+                    "safety_violations": float(row.get("safety_violations", 0.0)),
+                    "action_replacements": float(row.get("action_replacements", 0.0)),
                 }
             )
 
@@ -212,6 +221,15 @@ def compare_uav_height(
                         "path_length": float(row["path_length"]),
                         "avg_us_distance": float(row.get("avg_us_distance", row["us_distance"])),
                         "avg_sg_distance": float(row.get("avg_sg_distance", row["sg_distance"])),
+                        "avg_connected_fraction": float(
+                            row.get("avg_connected_fraction", row.get("connected_fraction", np.nan))
+                        ),
+                        "avg_target_distance": float(
+                            row.get("avg_target_distance", row.get("mean_target_distance", np.nan))
+                        ),
+                        "avg_lyapunov_value": float(row.get("avg_lyapunov_value", np.nan)),
+                        "safety_violations": float(row.get("safety_violations", 0.0)),
+                        "action_replacements": float(row.get("action_replacements", 0.0)),
                     }
                 )
 

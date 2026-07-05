@@ -101,6 +101,26 @@ def _save_energy_curve(energies: list[float], output_path: Path, title: str = "D
     plt.close(fig)
 
 
+def _mean_finite(values, default: float = np.nan) -> float:
+    values = np.asarray(list(values), dtype=float)
+    if values.size == 0:
+        return float(default)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float(default)
+    return float(np.mean(values))
+
+
+def _sum_finite(values) -> float:
+    values = np.asarray(list(values), dtype=float)
+    if values.size == 0:
+        return 0.0
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0
+    return float(np.sum(values))
+
+
 def train_dqn(
     config: Dict,
     variant: str = "dqn",
@@ -180,7 +200,24 @@ def train_dqn(
             "avg_us_distance": float(np.mean(env.history.get("us_distance", [np.nan]))),
             "avg_sg_distance": float(np.mean(env.history.get("sg_distance", [np.nan]))),
             "mean_target_distance": final_info.get("mean_target_distance", np.nan),
+            "avg_target_distance": _mean_finite(env.history.get("target_distance", [np.nan])),
             "connected_fraction": final_info.get("connected_fraction", np.nan),
+            "avg_connected_fraction": _mean_finite(env.history.get("connected_fraction", [np.nan])),
+            "lyapunov_value": final_info.get("lyapunov_value", np.nan),
+            "avg_lyapunov_value": _mean_finite(env.history.get("lyapunov_value", [np.nan])),
+            "avg_lyapunov_delta": _mean_finite(env.history.get("lyapunov_delta", [np.nan])),
+            "safety_violations": _sum_finite(env.history.get("safety_violation", [])),
+            "action_replacements": _sum_finite(env.history.get("action_replaced", [])),
+            "safety_filter_active": final_info.get("safety_filter_active", 0.0),
+            "fim_logdet": final_info.get("fim_logdet", np.nan),
+            "avg_fim_logdet": _mean_finite(env.history.get("fim_logdet", [np.nan])),
+            "fim_trace_inv": final_info.get("fim_trace_inv", np.nan),
+            "avg_fim_trace_inv": _mean_finite(env.history.get("fim_trace_inv", [np.nan])),
+            "fim_min_eigenvalue": final_info.get("fim_min_eigenvalue", np.nan),
+            "belief_error": final_info.get("belief_error", np.nan),
+            "avg_belief_error": _mean_finite(env.history.get("belief_error", [np.nan])),
+            "use_fim": final_info.get("use_fim", 0.0),
+            "use_belief_state": final_info.get("use_belief_state", 0.0),
         }
         records.append(record)
 
@@ -244,7 +281,24 @@ def evaluate_agent(config: Dict, agent, episodes: int | None = None, seed_offset
                 "avg_us_distance": float(np.mean(env.history.get("us_distance", [np.nan]))),
                 "avg_sg_distance": float(np.mean(env.history.get("sg_distance", [np.nan]))),
                 "mean_target_distance": final_info.get("mean_target_distance", np.nan),
+                "avg_target_distance": _mean_finite(env.history.get("target_distance", [np.nan])),
                 "connected_fraction": final_info.get("connected_fraction", np.nan),
+                "avg_connected_fraction": _mean_finite(env.history.get("connected_fraction", [np.nan])),
+                "lyapunov_value": final_info.get("lyapunov_value", np.nan),
+                "avg_lyapunov_value": _mean_finite(env.history.get("lyapunov_value", [np.nan])),
+                "avg_lyapunov_delta": _mean_finite(env.history.get("lyapunov_delta", [np.nan])),
+                "safety_violations": _sum_finite(env.history.get("safety_violation", [])),
+                "action_replacements": _sum_finite(env.history.get("action_replaced", [])),
+                "safety_filter_active": final_info.get("safety_filter_active", 0.0),
+                "fim_logdet": final_info.get("fim_logdet", np.nan),
+                "avg_fim_logdet": _mean_finite(env.history.get("fim_logdet", [np.nan])),
+                "fim_trace_inv": final_info.get("fim_trace_inv", np.nan),
+                "avg_fim_trace_inv": _mean_finite(env.history.get("fim_trace_inv", [np.nan])),
+                "fim_min_eigenvalue": final_info.get("fim_min_eigenvalue", np.nan),
+                "belief_error": final_info.get("belief_error", np.nan),
+                "avg_belief_error": _mean_finite(env.history.get("belief_error", [np.nan])),
+                "use_fim": final_info.get("use_fim", 0.0),
+                "use_belief_state": final_info.get("use_belief_state", 0.0),
             }
         )
     return pd.DataFrame.from_records(records)
@@ -268,11 +322,19 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--eval-episodes", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None, help="Override agent.learning_rate, e.g. 0.01.")
+    parser.add_argument("--use-lyapunov", action="store_true", help="Enable the Lyapunov action filter.")
+    parser.add_argument("--no-lyapunov", action="store_true", help="Disable the Lyapunov action filter.")
     args = parser.parse_args()
 
     config = load_config(args.config)
     if args.learning_rate is not None:
         config.setdefault("agent", {})["learning_rate"] = args.learning_rate
+    if args.use_lyapunov and args.no_lyapunov:
+        raise ValueError("Choose only one of --use-lyapunov or --no-lyapunov.")
+    if args.use_lyapunov:
+        config.setdefault("safety", {})["use_lyapunov"] = True
+    if args.no_lyapunov:
+        config.setdefault("safety", {})["use_lyapunov"] = False
     agent_name = normalize_agent_name(args.agent or args.variant or "dqn")
     agent, _history = train_dqn(config, variant=agent_name, episodes=args.episodes, save_outputs=True)
     eval_df = evaluate_agent(config, agent, episodes=args.eval_episodes)

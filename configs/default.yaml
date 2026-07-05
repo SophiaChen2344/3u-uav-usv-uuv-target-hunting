@@ -57,6 +57,17 @@ training:
   table_variant_episodes: 12
   progress_bar: true
 
+safety:
+  use_lyapunov: true
+  alpha_target: 1.0
+  alpha_formation: 0.0
+  alpha_conn: 0.5
+  alpha_energy: 0.2
+  alpha_boundary: 0.2
+  c: 0.001
+  epsilon: 1.0
+  fallback_mode: "least_unsafe"
+
 experiments:
   heights: [80.0, 120.0, 160.0, 200.0, 240.0]
   uuv_speeds: [6.0, 9.0, 12.0, 15.0, 18.0]
@@ -67,6 +78,9 @@ experiments:
     eval_episodes: 6
   table2:
     H: [50.0, 75.0, 100.0, 125.0]
+    train_episodes: 12
+    eval_episodes: 6
+  lyapunov_ablation:
     train_episodes: 12
     eval_episodes: 6
   aco:

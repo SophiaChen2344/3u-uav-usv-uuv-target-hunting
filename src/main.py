@@ -23,9 +23,18 @@ def load_config(path: str | Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the 3U target hunting reproduction pipeline.")
     parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config.")
+    parser.add_argument("--episodes", type=int, default=None, help="Override DQN training episodes for this run.")
+    parser.add_argument("--no-lyapunov", action="store_true", help="Disable the Lyapunov safety filter.")
     args = parser.parse_args()
 
     config = load_config(args.config)
+    if args.episodes is not None:
+        config.setdefault("training", {})["episodes"] = int(args.episodes)
+        config.setdefault("experiments", {}).setdefault("fig2", {})["dqn_train_episodes"] = int(args.episodes)
+        config.setdefault("experiments", {}).setdefault("table2", {})["train_episodes"] = int(args.episodes)
+    if args.no_lyapunov:
+        config.setdefault("safety", {})["use_lyapunov"] = False
+
     results = config.get("results", {})
     ensure_output_dirs(
         results.get("root", "results"),
@@ -58,4 +67,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

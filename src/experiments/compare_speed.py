@@ -95,6 +95,11 @@ def compare_uuv_speed(
                     "path_length": float(row["path_length"]),
                     "avg_us_distance": float(row["avg_us_distance"]),
                     "avg_sg_distance": float(row["avg_sg_distance"]),
+                    "avg_connected_fraction": float(row.get("avg_connected_fraction", row.get("connected_fraction", np.nan))),
+                    "avg_target_distance": float(row.get("avg_target_distance", row.get("mean_target_distance", np.nan))),
+                    "avg_lyapunov_value": float(row.get("avg_lyapunov_value", np.nan)),
+                    "safety_violations": float(row.get("safety_violations", 0.0)),
+                    "action_replacements": float(row.get("action_replacements", 0.0)),
                 }
             )
 
@@ -122,6 +127,15 @@ def compare_uuv_speed(
                         "path_length": float(row["path_length"]),
                         "avg_us_distance": float(row.get("avg_us_distance", row["us_distance"])),
                         "avg_sg_distance": float(row.get("avg_sg_distance", row["sg_distance"])),
+                        "avg_connected_fraction": float(
+                            row.get("avg_connected_fraction", row.get("connected_fraction", np.nan))
+                        ),
+                        "avg_target_distance": float(
+                            row.get("avg_target_distance", row.get("mean_target_distance", np.nan))
+                        ),
+                        "avg_lyapunov_value": float(row.get("avg_lyapunov_value", np.nan)),
+                        "safety_violations": float(row.get("safety_violations", 0.0)),
+                        "action_replacements": float(row.get("action_replacements", 0.0)),
                     }
                 )
 

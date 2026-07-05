@@ -75,6 +75,14 @@ def evaluate_aco(config: Dict, episodes: int | None = None, save_outputs: bool =
         energy_values = env.history.get("energy", [])
         us_distances = env.history.get("us_distance", [])
         sg_distances = env.history.get("sg_distance", [])
+        connected_fractions = env.history.get("connected_fraction", [])
+        target_distances = env.history.get("target_distance", [])
+        lyapunov_values = env.history.get("lyapunov_value", [])
+        safety_violations = env.history.get("safety_violation", [])
+        action_replacements = env.history.get("action_replaced", [])
+        fim_logdets = env.history.get("fim_logdet", [])
+        fim_trace_invs = env.history.get("fim_trace_inv", [])
+        belief_errors = env.history.get("belief_error", [])
         records.append(
             {
                 "episode": episode,
@@ -90,8 +98,24 @@ def evaluate_aco(config: Dict, episodes: int | None = None, save_outputs: bool =
                 "energy_used": final_info.get("total_energy_used", np.nan),
                 "avg_us_distance": float(np.mean(us_distances)) if us_distances else np.nan,
                 "avg_sg_distance": float(np.mean(sg_distances)) if sg_distances else np.nan,
+                "avg_connected_fraction": float(np.mean(connected_fractions)) if connected_fractions else np.nan,
                 "mean_target_distance": final_info.get("mean_target_distance", np.nan),
+                "avg_target_distance": float(np.mean(target_distances)) if target_distances else np.nan,
                 "connected_fraction": final_info.get("connected_fraction", np.nan),
+                "avg_lyapunov_value": float(np.mean(lyapunov_values)) if lyapunov_values else np.nan,
+                "lyapunov_value": final_info.get("lyapunov_value", np.nan),
+                "safety_violations": float(np.sum(safety_violations)) if safety_violations else 0.0,
+                "action_replacements": float(np.sum(action_replacements)) if action_replacements else 0.0,
+                "safety_filter_active": final_info.get("safety_filter_active", 0.0),
+                "fim_logdet": final_info.get("fim_logdet", np.nan),
+                "avg_fim_logdet": float(np.nanmean(fim_logdets)) if fim_logdets else np.nan,
+                "fim_trace_inv": final_info.get("fim_trace_inv", np.nan),
+                "avg_fim_trace_inv": float(np.nanmean(fim_trace_invs)) if fim_trace_invs else np.nan,
+                "fim_min_eigenvalue": final_info.get("fim_min_eigenvalue", np.nan),
+                "belief_error": final_info.get("belief_error", np.nan),
+                "avg_belief_error": float(np.nanmean(belief_errors)) if belief_errors else np.nan,
+                "use_fim": final_info.get("use_fim", 0.0),
+                "use_belief_state": final_info.get("use_belief_state", 0.0),
             }
         )
 

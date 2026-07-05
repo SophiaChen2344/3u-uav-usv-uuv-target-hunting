@@ -18,6 +18,12 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from sensing.fisher_information import (
+    fim_metrics,
+    fisher_information_matrix,
+    range_bearing_measurement,
+)
+
 
 @dataclass
 class ThreeUState:
@@ -33,6 +39,8 @@ class ThreeUState:
     previous_target_distance: float
     total_energy_used: float
     energy_budget: float
+    observed_target_position: np.ndarray | None = None
+    belief_target_position: np.ndarray | None = None
     target_escaped: bool = False
     constraint_violation: bool = False
 
@@ -40,6 +48,8 @@ class ThreeUState:
     def target_estimate(self) -> np.ndarray:
         """Compatibility alias for algorithms that expect an estimated target."""
 
+        if self.belief_target_position is not None:
+            return self.belief_target_position
         return self.target_position
 
     @property
@@ -95,6 +105,7 @@ class ThreeUEnv:
 
         self.area_size = float(self.env_config.get("area_size", 400.0))
         self.half_area = self.area_size / 2.0
+        self.max_depth = abs(float(self.env_config.get("max_depth", 120.0)))
         self.max_steps = int(self.env_config.get("max_steps", 100))
         self.dt = float(self.env_config.get("dt", 1.0))
         self.num_uuvs = int(self.env_config.get("num_uuvs", 3))
@@ -120,12 +131,30 @@ class ThreeUEnv:
         self.energy_linear = float(self.env_config.get("energy_linear", 0.8))
         self.energy_quadratic = float(self.env_config.get("energy_quadratic", 0.04))
         self.energy_budget = float(self.env_config.get("uuv_energy_budget", 65_000.0))
+        self.safety_config = dict(self.config.get("safety", {}))
+        self.use_lyapunov = bool(self.safety_config.get("use_lyapunov", False))
+        self.sensing_config = dict(self.config.get("sensing", {}))
+        self.use_fim = bool(self.sensing_config.get("use_fim", False))
+        self.use_belief_state = bool(self.sensing_config.get("use_belief_state", False))
+        self.observation_noise_uav = float(self.sensing_config.get("observation_noise_uav", 20.0))
+        self.observation_noise_usv = float(self.sensing_config.get("observation_noise_usv", 10.0))
+        self.observation_noise_uuv = float(self.sensing_config.get("observation_noise_uuv", 5.0))
+        self.fim_regularization = float(self.sensing_config.get("fim_regularization", 1e-6))
+        self.info_reward_weight = float(self.sensing_config.get("info_reward_weight", 0.01))
+        self.belief_update_alpha = float(self.sensing_config.get("belief_update_alpha", 0.35))
+        self.uuv_observation_range = float(
+            self.sensing_config.get("uuv_observation_range", self.env_config.get("sonar_radius", 130.0))
+        )
 
         self.state: ThreeUState | None = None
         self.last_info: Dict[str, float] = {}
         self.history: Dict[str, list[float]] = {}
         self.action_tuples = [(action,) for action in range(self.action_space_n)]
         self._last_boundary_violation = False
+        self.current_fim = np.zeros((3, 3), dtype=float)
+        self.current_fim_metrics = self._empty_fim_metrics()
+        self.current_belief_error = 0.0
+        self.current_normalized_logdet = 0.0
 
     def seed(self, seed: int | None = None) -> list[int | None]:
         """Set the environment random seed."""
@@ -157,15 +186,34 @@ class ThreeUEnv:
             previous_target_distance=target_distance,
             total_energy_used=0.0,
             energy_budget=self.energy_budget,
+            observed_target_position=target_position.copy(),
+            belief_target_position=target_position.copy(),
         )
+        self._update_sensing(initial=True)
         self.history = {
             "energy": [],
             "us_distance": [],
             "sg_distance": [],
+            "connected_fraction": [],
             "target_distance": [target_distance],
+            "fim_logdet": [],
+            "fim_trace_inv": [],
+            "fim_min_eigenvalue": [],
+            "fim_condition_number": [],
+            "belief_error": [],
+            "target_true_position": [],
+            "target_belief_position": [],
+            "lyapunov_value": [],
+            "lyapunov_delta": [],
+            "lyapunov_condition_satisfied": [],
+            "safety_violation": [],
+            "original_action": [],
+            "executed_action": [],
+            "action_replaced": [],
         }
         self._last_boundary_violation = False
         self.last_info = self._build_info(reward=0.0, done=False)
+        self._attach_reset_safety_info()
         return self.get_state()
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, float]]:
@@ -173,6 +221,11 @@ class ThreeUEnv:
 
         self._require_state()
         action = int(np.clip(action, 0, self.action_space_n - 1))
+        original_action = action
+        previous_state_vector = self.get_state().copy()
+        previous_metrics = dict(self.last_info)
+        selection_info = self._select_executed_action(action)
+        action = int(selection_info.get("executed_action", action))
 
         previous_center = self.state.uuv_center.copy()
         self.state.previous_target_distance = self._target_distance()
@@ -185,6 +238,7 @@ class ThreeUEnv:
         self._move_usv_randomly()
         self._move_target_away_from_group()
         self.state.direction_gw = self._unit_vector(self.state.target_position - self.state.uuv_center)
+        self._update_sensing(initial=False)
 
         step_energy = self._compute_step_energy(actual_move)
         self.state.total_energy_used += step_energy
@@ -200,6 +254,14 @@ class ThreeUEnv:
 
         self._append_logs(step_energy)
         info = self._build_info(reward=reward, done=done)
+        self._attach_step_safety_info(
+            info=info,
+            previous_state=previous_state_vector,
+            previous_metrics=previous_metrics,
+            original_action=original_action,
+            executed_action=action,
+            selection_info=selection_info,
+        )
         self.last_info = info
         return self.get_state(), reward, done, info
 
@@ -207,13 +269,15 @@ class ThreeUEnv:
         """Return ``[U, S, G, W, direction_GW, L]`` as a float32 vector."""
 
         self._require_state()
+        target_for_policy = self._policy_target_position()
+        direction_for_policy = self._unit_vector(target_for_policy - self.state.uuv_center)
         return np.concatenate(
             [
                 self.state.uav_position,
                 self.state.usv_position,
                 self.state.uuv_center,
-                self.state.target_position,
-                self.state.direction_gw,
+                target_for_policy,
+                direction_for_policy,
                 np.array([self.state.total_voyage_distance], dtype=float),
             ]
         ).astype(np.float32)
@@ -225,10 +289,10 @@ class ThreeUEnv:
         if self.state.constraint_violation or self.state.target_escaped:
             return -1.0
         if self._target_captured():
-            return 10.0
+            return float(10.0 + self._information_reward())
         if self._target_distance() < self.state.previous_target_distance:
-            return 0.1
-        return -1.0
+            return float(0.1 + self._information_reward())
+        return float(-1.0 + self._information_reward())
 
     def check_constraints(self) -> bool:
         """Check boundary and simple communication constraints."""
@@ -261,7 +325,8 @@ class ThreeUEnv:
             f"G=({self.state.uuv_center[0]:.1f}, {self.state.uuv_center[1]:.1f}, {self.state.uuv_center[2]:.1f}) "
             f"W=({self.state.target_position[0]:.1f}, {self.state.target_position[1]:.1f}, "
             f"{self.state.target_position[2]:.1f}) "
-            f"d_GW={self._target_distance():.1f} L={self.state.total_voyage_distance:.1f}"
+            f"d_GW={self._target_distance():.1f} belief_err={self.current_belief_error:.1f} "
+            f"L={self.state.total_voyage_distance:.1f}"
         )
         if mode == "human":
             print(summary)
@@ -271,7 +336,7 @@ class ThreeUEnv:
         """Return the compass action whose direction best points from G to W."""
 
         self._require_state()
-        return self.action_from_vector(self.state.target_position[:2] - self.state.uuv_center[:2])
+        return self.action_from_vector(self._policy_target_position()[:2] - self.state.uuv_center[:2])
 
     def action_from_vector(self, vector_xy: np.ndarray) -> int:
         """Map a 2D vector to the nearest of the eight movement actions."""
@@ -337,10 +402,23 @@ class ThreeUEnv:
         return float(self.num_uuvs * per_uuv)
 
     def _append_logs(self, step_energy: float) -> None:
+        us_distance = self._us_distance()
+        sg_distance = self._sg_distance()
+        connected_fraction = 0.5 * float(us_distance <= self.uav_usv_range) + 0.5 * float(
+            sg_distance <= self.usv_uuv_range
+        )
         self.history["energy"].append(float(step_energy))
-        self.history["us_distance"].append(self._us_distance())
-        self.history["sg_distance"].append(self._sg_distance())
+        self.history["us_distance"].append(us_distance)
+        self.history["sg_distance"].append(sg_distance)
+        self.history["connected_fraction"].append(connected_fraction)
         self.history["target_distance"].append(self._target_distance())
+        self.history["fim_logdet"].append(float(self.current_fim_metrics.get("logdet", np.nan)))
+        self.history["fim_trace_inv"].append(float(self.current_fim_metrics.get("trace_inv", np.nan)))
+        self.history["fim_min_eigenvalue"].append(float(self.current_fim_metrics.get("min_eigenvalue", np.nan)))
+        self.history["fim_condition_number"].append(float(self.current_fim_metrics.get("condition_number", np.nan)))
+        self.history["belief_error"].append(float(self.current_belief_error))
+        self.history["target_true_position"].append(self.state.target_position.copy())
+        self.history["target_belief_position"].append(self._belief_target_position().copy())
 
     def _build_info(self, reward: float, done: bool) -> Dict[str, float]:
         captured = self._target_captured()
@@ -348,6 +426,8 @@ class ThreeUEnv:
         us_distance = self._us_distance()
         sg_distance = self._sg_distance()
         target_distance = self._target_distance()
+        belief_position = self._belief_target_position()
+        observed_position = self._observed_target_position()
         connected_fraction = 0.5 * float(us_distance <= self.uav_usv_range) + 0.5 * float(
             sg_distance <= self.usv_uuv_range
         )
@@ -372,7 +452,232 @@ class ThreeUEnv:
             "all_connected": float(connected_fraction == 1.0),
             "remaining_energy_mean": float(np.mean(self.state.uuv_energy)),
             "remaining_energy_min": float(np.min(self.state.uuv_energy)),
+            "fim_logdet": float(self.current_fim_metrics.get("logdet", np.nan)),
+            "fim_trace_inv": float(self.current_fim_metrics.get("trace_inv", np.nan)),
+            "fim_min_eigenvalue": float(self.current_fim_metrics.get("min_eigenvalue", np.nan)),
+            "fim_condition_number": float(self.current_fim_metrics.get("condition_number", np.nan)),
+            "normalized_logdet_fim": float(self.current_normalized_logdet),
+            "belief_error": float(self.current_belief_error),
+            "target_true_position": self.state.target_position.copy(),
+            "target_belief_position": belief_position.copy(),
+            "target_observed_position": observed_position.copy(),
+            "target_true_x": float(self.state.target_position[0]),
+            "target_true_y": float(self.state.target_position[1]),
+            "target_true_z": float(self.state.target_position[2]),
+            "target_belief_x": float(belief_position[0]),
+            "target_belief_y": float(belief_position[1]),
+            "target_belief_z": float(belief_position[2]),
+            "target_observed_x": float(observed_position[0]),
+            "target_observed_y": float(observed_position[1]),
+            "target_observed_z": float(observed_position[2]),
+            "use_fim": float(self.use_fim),
+            "use_belief_state": float(self.use_belief_state),
         }
+
+    def _update_sensing(self, initial: bool = False) -> None:
+        """Update noisy target observation, belief, and FIM diagnostics."""
+
+        self._require_state()
+        true_target = self.state.target_position.copy()
+
+        if self.use_belief_state:
+            fused_observation = self._fused_noisy_position_observation(true_target)
+            previous_belief = self._belief_target_position()
+            if initial:
+                belief = fused_observation
+            else:
+                alpha = float(np.clip(self.belief_update_alpha, 0.0, 1.0))
+                belief = alpha * previous_belief + (1.0 - alpha) * fused_observation
+            belief = self._clip_target_belief(belief)
+        else:
+            fused_observation = true_target.copy()
+            belief = true_target.copy()
+
+        self.state.observed_target_position = fused_observation.copy()
+        self.state.belief_target_position = belief.copy()
+        self.current_belief_error = self._distance(true_target, belief)
+
+        if self.use_fim:
+            sensor_positions, noise_covariances = self._fim_sensor_inputs(true_target)
+            self.current_fim = fisher_information_matrix(true_target, sensor_positions, noise_covariances)
+            self.current_fim_metrics = fim_metrics(self.current_fim, regularization=self.fim_regularization)
+            logdet = float(self.current_fim_metrics.get("logdet", 0.0))
+            self.current_normalized_logdet = float(np.tanh(logdet / 10.0))
+        else:
+            self.current_fim = np.zeros((3, 3), dtype=float)
+            self.current_fim_metrics = self._empty_fim_metrics()
+            self.current_normalized_logdet = 0.0
+
+    def _fused_noisy_position_observation(self, true_target: np.ndarray) -> np.ndarray:
+        estimates = []
+        variances = []
+
+        estimates.append(self._cartesian_position_observation(true_target, self.observation_noise_uav, z_scale=0.5))
+        variances.append(max(self.observation_noise_uav**2, 1e-9))
+
+        estimates.append(self._cartesian_position_observation(true_target, self.observation_noise_usv, z_scale=0.35))
+        variances.append(max(self.observation_noise_usv**2, 1e-9))
+
+        if self._target_distance() <= self.uuv_observation_range:
+            estimates.append(self._uuv_range_bearing_position_observation(true_target))
+            variances.append(max(self.observation_noise_uuv**2, 1e-9))
+
+        weights = 1.0 / np.asarray(variances, dtype=float)
+        weights = weights / max(float(np.sum(weights)), 1e-12)
+        fused = np.zeros(3, dtype=float)
+        for weight, estimate in zip(weights, estimates):
+            fused += float(weight) * estimate
+        return self._clip_target_belief(fused)
+
+    def _cartesian_position_observation(self, true_target: np.ndarray, noise_std: float, z_scale: float) -> np.ndarray:
+        std = max(float(noise_std), 0.0)
+        noise = self.rng.normal(0.0, std, size=3)
+        noise[2] *= float(z_scale)
+        observation = true_target + noise
+        return self._clip_target_belief(observation)
+
+    def _uuv_range_bearing_position_observation(self, true_target: np.ndarray) -> np.ndarray:
+        measurement = range_bearing_measurement(true_target, self.state.uuv_center)
+        horizontal_distance = max(float(np.linalg.norm(true_target[:2] - self.state.uuv_center[:2])), 1.0)
+        range_noise = self.rng.normal(0.0, self.observation_noise_uuv)
+        bearing_noise = self.rng.normal(0.0, self.observation_noise_uuv / horizontal_distance)
+        noisy_range = max(0.0, float(measurement[0] + range_noise))
+        noisy_bearing = float(measurement[1] + bearing_noise)
+
+        estimate = self.state.uuv_center.copy()
+        estimate[0] += noisy_range * np.cos(noisy_bearing)
+        estimate[1] += noisy_range * np.sin(noisy_bearing)
+        estimate[2] = true_target[2] + self.rng.normal(0.0, self.observation_noise_uuv * 0.25)
+        return self._clip_target_belief(estimate)
+
+    def _fim_sensor_inputs(self, true_target: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        sensor_positions = [self.state.uav_position.copy(), self.state.usv_position.copy()]
+        noise_covariances = [
+            self._range_bearing_covariance(true_target, self.state.uav_position, self.observation_noise_uav),
+            self._range_bearing_covariance(true_target, self.state.usv_position, self.observation_noise_usv),
+        ]
+        if self._target_distance() <= self.uuv_observation_range:
+            sensor_positions.append(self.state.uuv_center.copy())
+            noise_covariances.append(
+                self._range_bearing_covariance(true_target, self.state.uuv_center, self.observation_noise_uuv)
+            )
+        return sensor_positions, noise_covariances
+
+    def _range_bearing_covariance(self, target: np.ndarray, sensor: np.ndarray, position_noise_std: float) -> np.ndarray:
+        std = max(float(position_noise_std), 1e-9)
+        horizontal_distance = max(float(np.linalg.norm(target[:2] - sensor[:2])), 1.0)
+        bearing_std = std / horizontal_distance
+        return np.diag([std**2, bearing_std**2]).astype(float)
+
+    def _information_reward(self) -> float:
+        if not self.use_fim:
+            return 0.0
+        return float(self.info_reward_weight * self.current_normalized_logdet)
+
+    def _empty_fim_metrics(self) -> Dict[str, float]:
+        return {
+            "logdet": np.nan,
+            "trace_inv": np.nan,
+            "min_eigenvalue": np.nan,
+            "condition_number": np.nan,
+        }
+
+    def _policy_target_position(self) -> np.ndarray:
+        if self.use_belief_state:
+            return self._belief_target_position()
+        return self.state.target_position
+
+    def _belief_target_position(self) -> np.ndarray:
+        if self.state.belief_target_position is None:
+            return self.state.target_position
+        return self.state.belief_target_position
+
+    def _observed_target_position(self) -> np.ndarray:
+        if self.state.observed_target_position is None:
+            return self._belief_target_position()
+        return self.state.observed_target_position
+
+    def _clip_target_belief(self, position: np.ndarray) -> np.ndarray:
+        clipped = self._clip_position(np.asarray(position, dtype=float).copy())
+        clipped[2] = np.clip(clipped[2], -self.max_depth, 0.0)
+        return clipped
+
+    def _select_executed_action(self, action: int) -> Dict[str, float]:
+        if not self.use_lyapunov:
+            return {
+                "original_action": float(action),
+                "executed_action": float(action),
+                "action_replaced": 0.0,
+                "proposed_was_safe": 1.0,
+                "safety_filter_active": 0.0,
+            }
+
+        from safety.lyapunov import select_safe_action
+
+        executed_action, safety_info = select_safe_action(self, action, range(self.action_space_n), self.config)
+        safety_info = dict(safety_info)
+        safety_info["executed_action"] = float(executed_action)
+        safety_info["safety_filter_active"] = 1.0
+        return safety_info
+
+    def _attach_reset_safety_info(self) -> None:
+        from safety.lyapunov import lyapunov_value
+
+        value = lyapunov_value(self.get_state(), self.last_info, self.config)
+        self.last_info.update(
+            {
+                "lyapunov_value": float(value),
+                "lyapunov_delta": 0.0,
+                "lyapunov_condition_satisfied": 1.0,
+                "safety_violation": 0.0,
+                "safety_filter_active": float(self.use_lyapunov),
+                "original_action": -1.0,
+                "executed_action": -1.0,
+                "action_replaced": 0.0,
+            }
+        )
+
+    def _attach_step_safety_info(
+        self,
+        info: Dict[str, float],
+        previous_state: np.ndarray,
+        previous_metrics: Dict[str, float],
+        original_action: int,
+        executed_action: int,
+        selection_info: Dict[str, float],
+    ) -> None:
+        from safety.lyapunov import is_safe_transition, lyapunov_delta, lyapunov_value
+
+        current_state = self.get_state()
+        value = lyapunov_value(current_state, info, self.config)
+        delta = lyapunov_delta(previous_state, current_state, previous_metrics, info, self.config)
+        condition_satisfied = is_safe_transition(previous_state, current_state, previous_metrics, info, self.config)
+        safety_violation = float(not condition_satisfied)
+        action_replaced = float(original_action != executed_action)
+
+        info.update(
+            {
+                "lyapunov_value": float(value),
+                "lyapunov_delta": float(delta),
+                "lyapunov_condition_satisfied": float(condition_satisfied),
+                "safety_violation": safety_violation,
+                "safety_filter_active": float(self.use_lyapunov),
+                "original_action": float(original_action),
+                "executed_action": float(executed_action),
+                "action_replaced": action_replaced,
+                "proposed_was_safe": float(selection_info.get("proposed_was_safe", condition_satisfied)),
+                "predicted_lyapunov_margin": float(selection_info.get("lyapunov_margin", np.nan)),
+                "predicted_lyapunov_value": float(selection_info.get("lyapunov_value", np.nan)),
+            }
+        )
+
+        self.history["lyapunov_value"].append(float(value))
+        self.history["lyapunov_delta"].append(float(delta))
+        self.history["lyapunov_condition_satisfied"].append(float(condition_satisfied))
+        self.history["safety_violation"].append(safety_violation)
+        self.history["original_action"].append(float(original_action))
+        self.history["executed_action"].append(float(executed_action))
+        self.history["action_replaced"].append(action_replaced)
 
     def _target_captured(self) -> bool:
         return bool(self._target_distance() <= self.search_radius)

@@ -33,6 +33,16 @@ def load_config(path: str | Path) -> Dict:
         return yaml.safe_load(handle)
 
 
+def _mean_finite(values, default: float = np.nan) -> float:
+    values = np.asarray(list(values), dtype=float)
+    if values.size == 0:
+        return float(default)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float(default)
+    return float(np.mean(values))
+
+
 def evaluate_aco(config: Dict, episodes: int | None = None, save_outputs: bool = True) -> pd.DataFrame:
     """Evaluate the ACO baseline and save per-episode metrics."""
 
@@ -108,12 +118,12 @@ def evaluate_aco(config: Dict, episodes: int | None = None, save_outputs: bool =
                 "action_replacements": float(np.sum(action_replacements)) if action_replacements else 0.0,
                 "safety_filter_active": final_info.get("safety_filter_active", 0.0),
                 "fim_logdet": final_info.get("fim_logdet", np.nan),
-                "avg_fim_logdet": float(np.nanmean(fim_logdets)) if fim_logdets else np.nan,
+                "avg_fim_logdet": _mean_finite(fim_logdets),
                 "fim_trace_inv": final_info.get("fim_trace_inv", np.nan),
-                "avg_fim_trace_inv": float(np.nanmean(fim_trace_invs)) if fim_trace_invs else np.nan,
+                "avg_fim_trace_inv": _mean_finite(fim_trace_invs),
                 "fim_min_eigenvalue": final_info.get("fim_min_eigenvalue", np.nan),
                 "belief_error": final_info.get("belief_error", np.nan),
-                "avg_belief_error": float(np.nanmean(belief_errors)) if belief_errors else np.nan,
+                "avg_belief_error": _mean_finite(belief_errors),
                 "use_fim": final_info.get("use_fim", 0.0),
                 "use_belief_state": final_info.get("use_belief_state", 0.0),
             }

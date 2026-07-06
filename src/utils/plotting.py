@@ -47,6 +47,34 @@ def save_energy_comparison(labels: Sequence[str], energy_values: Sequence[float]
     plt.close(fig)
 
 
+def save_grouped_metric_curve(
+    df: pd.DataFrame,
+    x_column: str,
+    y_column: str,
+    group_column: str,
+    output_path: str | Path,
+    title: str,
+    ylabel: str,
+    xlabel: str = "Episode",
+) -> None:
+    """Save one line per group for an episode-level metric."""
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for group_name, group in df.groupby(group_column):
+        group = group.sort_values(x_column)
+        ax.plot(group[x_column], group[y_column], linewidth=1.7, label=str(group_name))
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
 def save_height_plot(df: pd.DataFrame, output_path: str | Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,4 +125,3 @@ def save_dataframe(df: pd.DataFrame, output_path: str | Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)
-

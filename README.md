@@ -6,9 +6,11 @@ implements a compact 3U simulator, energy and connectivity models, DQN-family
 controllers, an Ant Colony Optimization baseline, and experiment scripts for
 Fig. 2-like, Fig. 3-like, and Table II-like comparisons.
 
-The current version also includes a Lyapunov-inspired safety filter for UUV
-action selection. The filter is an educational one-step safety heuristic, not a
-formal proof of global stability.
+The current version also includes noisy target sensing with Fisher Information
+Matrix (FIM) diagnostics, a one-step Stackelberg pursuit-evasion game for
+rational target motion, a Lyapunov-inspired safety filter, and a lightweight
+Conditional Flow Matching trajectory proposal module. These additions are
+educational approximations, not formal proofs or official paper code.
 
 ## Paper Citation
 
@@ -38,9 +40,20 @@ reproduction-style simulation results, not as exact paper results.
   optional acoustic communication term.
 - Connectivity model: UAV-USV connectivity and underwater USV-UUV graph
   connectivity are approximated from distances.
+- Sensing and belief model: UAV, USV, and UUV-center observations are noisy,
+  and the DQN can use a fused target-position belief instead of the true target
+  position.
+- Fisher Information Matrix: A range-bearing FIM estimates how informative the
+  current platform geometry is for 3D target-position estimation.
+- Stackelberg pursuit-evasion game: The DQN proposes a UUV action, the target
+  computes a best-response escape action, and the 3U leader can select a
+  lower-cost action before the Lyapunov filter is applied.
 - Lyapunov-inspired safety filter: Candidate UUV actions are screened with a
   scalar function that combines target distance, connectivity risk, energy
   imbalance risk, and boundary risk.
+- Conditional Flow Matching: A small MLP vector field generates smooth
+  short-horizon UUV-center trajectory candidates conditioned on state, target
+  belief, energy, connectivity, FIM, and predicted target response metrics.
 - DQN / Double DQN / Dueling DQN: PyTorch agents learn UUV group-center
   trajectory decisions.
 - ACO baseline: A grid-based Ant Colony Optimization planner provides a
@@ -73,6 +86,14 @@ reproduction-style simulation results, not as exact paper results.
 |   |   |-- replay_buffer.py
 |   |   |-- plotting.py
 |   |   `-- seed.py
+|   |-- sensing/
+|   |   `-- fisher_information.py
+|   |-- game/
+|   |   `-- stackelberg.py
+|   |-- generative/
+|   |   |-- flow_matching.py
+|   |   |-- trajectory_dataset.py
+|   |   `-- train_flow_matching.py
 |   |-- safety/
 |   |   `-- lyapunov.py
 |   `-- experiments/
@@ -81,13 +102,18 @@ reproduction-style simulation results, not as exact paper results.
 |       |-- compare_height.py
 |       |-- compare_speed.py
 |       |-- reproduce_table2.py
-|       `-- ablation_lyapunov.py
+|       |-- ablation_fim.py
+|       |-- ablation_flow_matching.py
+|       |-- ablation_lyapunov.py
+|       `-- ablation_stackelberg.py
 |-- results/
 |   |-- figures/
 |   |-- tables/
-|   `-- checkpoints/
+|   |-- checkpoints/
+|   `-- datasets/
 `-- tests/
-    `-- test_env.py
+    |-- test_env.py
+    `-- test_flow_matching.py
 ```
 
 ## Installation
@@ -110,6 +136,16 @@ Run the main reproduction pipeline:
 
 ```bash
 python src/main.py --config configs/default.yaml
+```
+
+Run planner modes from the main entry point:
+
+```bash
+python src/main.py --config configs/default.yaml --planner dqn
+python src/main.py --config configs/default.yaml --planner dqn_lyapunov
+python src/main.py --config configs/default.yaml --planner dqn_fim_stackelberg_lyapunov
+python src/main.py --config configs/default.yaml --planner flow_matching
+python src/main.py --config configs/default.yaml --planner full
 ```
 
 Train or evaluate DQN-family agents:
@@ -146,6 +182,25 @@ Run the Lyapunov safety ablation:
 python src/experiments/ablation_lyapunov.py
 ```
 
+Run the FIM and noisy-belief ablation:
+
+```bash
+python src/experiments/ablation_fim.py
+```
+
+Run the Stackelberg pursuit-evasion ablation:
+
+```bash
+python src/experiments/ablation_stackelberg.py
+```
+
+Train the Flow Matching trajectory generator and run its ablation:
+
+```bash
+python src/generative/train_flow_matching.py --dataset-size 512 --epochs 5 --regenerate-dataset
+python src/experiments/ablation_flow_matching.py
+```
+
 For a short smoke run of the main pipeline:
 
 ```bash
@@ -180,17 +235,42 @@ Common outputs include:
 - `fig3_results.csv`
 - `table2_reproduction.csv`
 - `table2_reproduction.md`
+- `ablation_fim.csv`
+- `ablation_flow_matching.csv`
 - `ablation_lyapunov.csv`
+- `ablation_stackelberg.csv`
+
+The FIM ablation also writes:
+
+- `fim_logdet_curve.png`
+- `belief_error_curve.png`
 
 The Lyapunov ablation also writes:
 
 - `lyapunov_curve.png`
 - `lyapunov_ablation.png`
 
+The Stackelberg ablation also writes:
+
+- `stackelberg_distance_curve.png`
+- `stackelberg_success_rate.png`
+
+The Flow Matching ablation also writes:
+
+- `flow_matching_trajectories.png`
+- `flow_matching_ablation.png`
+- `trajectory_smoothness.png`
+
 Model checkpoints are saved under:
 
 ```text
 results/checkpoints/
+```
+
+Synthetic trajectory datasets are saved under:
+
+```text
+results/datasets/
 ```
 
 ## Known Differences From The Paper
@@ -199,6 +279,18 @@ results/checkpoints/
   code.
 - The UUV team is represented by a cluster center.
 - The USV movement and target escape behavior are simplified.
+- The sensing model uses a compact Gaussian range-bearing approximation rather
+  than a calibrated physical sensor stack.
+- The UUV team belief state is a fused target-position estimate, not a full
+  Bayesian multi-target tracker.
+- The Stackelberg game is a one-step discrete best-response approximation; it
+  is designed to test the pursuit-evasion idea without making DQN training
+  prohibitively slow.
+- The Flow Matching generator is trained on synthetic trajectories from DQN
+  rollouts, ACO-style paths, heuristic pursuit, and safety-filtered simulator
+  rollouts because no official expert trajectory dataset is available.
+- Flow Matching currently acts as a proposal generator; it does not replace
+  the DQN controller by default.
 - Exact numerical results may differ from the paper.
 - The ACO baseline is a standard grid-based approximation rather than an
   official baseline implementation.
@@ -210,7 +302,10 @@ results/checkpoints/
 - Multi-target hunting.
 - More realistic UUV dynamics.
 - More intelligent target escape strategy.
+- Longer-horizon pursuit-evasion planning.
+- Higher-capacity diffusion or flow policies trained on richer simulator data.
 - Multi-agent reinforcement learning.
+- Extended Kalman filtering or particle filtering for target belief updates.
 - Learned UAV and USV policies instead of simple scripted movement.
 
 ## License

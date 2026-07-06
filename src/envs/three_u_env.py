@@ -5,7 +5,8 @@ This environment follows a compact abstraction of the 3U hunting problem:
 - one UAV monitors the 400 m x 400 m area from altitude ``h``;
 - one USV performs a random surface relay walk at ``z = 0``;
 - three UUVs are represented by a single underwater group center ``G``;
-- the target stays at the hunting depth and moves away from ``G``.
+- the target stays at the hunting depth and can either move away from ``G`` or
+  use a one-step Stackelberg best response.
 
 The API is intentionally Gym-like but does not depend on Gym/Gymnasium.
 """
@@ -70,7 +71,10 @@ class ThreeUEnv:
     """Simplified 3U target hunting simulator.
 
     State vector:
-        ``[U(t), S(t), G(t), W(t), direction_GW, total_voyage_distance]``
+        ``[U(t), S(t), G(t), W(t), direction_GW, total_voyage_distance]``.
+        When ``sensing.use_belief_state`` is true, ``W(t)`` and
+        ``direction_GW`` are computed from the noisy target belief rather than
+        the true target position.
 
     Action ids use eight compass directions for the UUV group center:
         0 east, 1 north-east, 2 north, 3 north-west,
@@ -145,6 +149,14 @@ class ThreeUEnv:
         self.uuv_observation_range = float(
             self.sensing_config.get("uuv_observation_range", self.env_config.get("sonar_radius", 130.0))
         )
+        self.game_config = dict(self.config.get("game", {}))
+        self.use_stackelberg = bool(self.game_config.get("use_stackelberg", False))
+        self.use_intelligent_target = bool(
+            self.game_config.get(
+                "use_intelligent_target",
+                self.use_stackelberg or str(self.game_config.get("target_model", "")).lower() == "intelligent",
+            )
+        )
 
         self.state: ThreeUState | None = None
         self.last_info: Dict[str, float] = {}
@@ -155,6 +167,7 @@ class ThreeUEnv:
         self.current_fim_metrics = self._empty_fim_metrics()
         self.current_belief_error = 0.0
         self.current_normalized_logdet = 0.0
+        self._last_game_step_info: Dict[str, float] = self._default_game_info()
 
     def seed(self, seed: int | None = None) -> list[int | None]:
         """Set the environment random seed."""
@@ -195,6 +208,9 @@ class ThreeUEnv:
             "us_distance": [],
             "sg_distance": [],
             "connected_fraction": [],
+            "uav_usv_probability": [],
+            "underwater_delta_bar": [],
+            "fim_trace": [],
             "target_distance": [target_distance],
             "fim_logdet": [],
             "fim_trace_inv": [],
@@ -210,8 +226,14 @@ class ThreeUEnv:
             "original_action": [],
             "executed_action": [],
             "action_replaced": [],
+            "target_best_response_action": [],
+            "stackelberg_selected_action": [],
+            "stackelberg_leader_cost": [],
+            "target_utility": [],
+            "stackelberg_changed_action": [],
         }
         self._last_boundary_violation = False
+        self._last_game_step_info = self._default_game_info()
         self.last_info = self._build_info(reward=0.0, done=False)
         self._attach_reset_safety_info()
         return self.get_state()
@@ -226,6 +248,7 @@ class ThreeUEnv:
         previous_metrics = dict(self.last_info)
         selection_info = self._select_executed_action(action)
         action = int(selection_info.get("executed_action", action))
+        target_decision = self._select_target_response(action, selection_info)
 
         previous_center = self.state.uuv_center.copy()
         self.state.previous_target_distance = self._target_distance()
@@ -236,7 +259,7 @@ class ThreeUEnv:
         self.state.total_voyage_distance += actual_move
 
         self._move_usv_randomly()
-        self._move_target_away_from_group()
+        self._move_target(target_decision)
         self.state.direction_gw = self._unit_vector(self.state.target_position - self.state.uuv_center)
         self._update_sensing(initial=False)
 
@@ -252,6 +275,7 @@ class ThreeUEnv:
         self.state.step_count += 1
         done = bool(captured or escaped or self.state.step_count >= self.max_steps)
 
+        self._last_game_step_info = self._merge_game_step_info(selection_info, target_decision)
         self._append_logs(step_energy)
         info = self._build_info(reward=reward, done=done)
         self._attach_step_safety_info(
@@ -349,6 +373,171 @@ class ThreeUEnv:
         scores = self.ACTION_DIRECTIONS @ unit
         return int(np.argmax(scores))
 
+    def project_position(self, position: np.ndarray) -> np.ndarray:
+        """Project a 3D point into the square horizontal search region."""
+
+        return self._clip_position(np.asarray(position, dtype=float))
+
+    def project_trajectory(self, trajectory: np.ndarray) -> np.ndarray:
+        """Project one or many generated UUV-center trajectories into bounds."""
+
+        projected = np.asarray(trajectory, dtype=float).copy()
+        projected[..., 0] = np.clip(projected[..., 0], 0.0, self.area_size)
+        projected[..., 1] = np.clip(projected[..., 1], 0.0, self.area_size)
+        projected[..., 2] = self.uuv_initial_depth
+        return projected.astype(np.float32)
+
+    def trajectory_to_action(self, trajectory: np.ndarray) -> int:
+        """Convert the first segment of a continuous trajectory to an action id."""
+
+        self._require_state()
+        trajectory = np.asarray(trajectory, dtype=float)
+        if trajectory.ndim == 3:
+            trajectory = trajectory[0]
+        if trajectory.size == 0:
+            return self.greedy_action_toward_target()
+        first_point = trajectory.reshape(-1, 3)[0]
+        return self.action_from_vector(first_point[:2] - self.state.uuv_center[:2])
+
+    def get_connectivity_metrics(self) -> Dict[str, float]:
+        """Return distance-based communication diagnostics for planners."""
+
+        self._require_state()
+        us_distance = self._us_distance()
+        sg_distance = self._sg_distance()
+        us_ratio = us_distance / max(self.uav_usv_range, 1e-9)
+        sg_ratio = sg_distance / max(self.usv_uuv_range, 1e-9)
+        connected_fraction = 0.5 * float(us_ratio <= 1.0) + 0.5 * float(sg_ratio <= 1.0)
+        probability = float(np.exp(-np.clip(us_ratio**2, 0.0, 700.0)))
+        delta_bar = self._underwater_delta_bar(self.state.uuv_center)
+        return {
+            "us_distance": float(us_distance),
+            "sg_distance": float(sg_distance),
+            "us_ratio": float(us_ratio),
+            "sg_ratio": float(sg_ratio),
+            "connected_fraction": float(connected_fraction),
+            "uav_usv_probability": probability,
+            "underwater_delta_bar": float(delta_bar),
+        }
+
+    def compute_fim_metrics(self) -> Dict[str, float]:
+        """Return a stable FIM-style proxy for the current UUV/target geometry."""
+
+        self._require_state()
+        connectivity = self.get_connectivity_metrics()
+        comm_risk = connectivity["us_ratio"] ** 2 + connectivity["sg_ratio"] ** 2
+        return self.compute_fim_metrics_for(self.state.uuv_center, self._belief_target_position(), comm_risk=comm_risk)
+
+    def compute_fim_metrics_for(
+        self,
+        uuv_center: np.ndarray,
+        target_position: np.ndarray,
+        comm_risk: float = 0.0,
+    ) -> Dict[str, float]:
+        """Return FIM metrics for a candidate UUV-center/target geometry.
+
+        Flow-matching and Stackelberg helpers consume the older
+        ``fim_trace``/``fim_determinant`` keys, so this method preserves them
+        while computing the values from the range-bearing FIM module.
+        """
+
+        target = np.asarray(target_position, dtype=float)
+        candidate_center = np.asarray(uuv_center, dtype=float)
+        sensor_positions, noise_covariances = self._fim_sensor_inputs_for(target, candidate_center)
+        fim = fisher_information_matrix(target, sensor_positions, noise_covariances)
+        if comm_risk > 0.0:
+            fim = fim / (1.0 + max(float(comm_risk), 0.0))
+
+        metrics = fim_metrics(fim, regularization=self.fim_regularization)
+        trace = float(np.trace(fim + self.fim_regularization * np.eye(3, dtype=float)))
+        determinant = float(np.exp(np.clip(metrics["logdet"], -700.0, 700.0)))
+        return {
+            "fim_trace": trace,
+            "fim_trace_inv": float(metrics["trace_inv"]),
+            "fim_determinant": determinant,
+            "target_information_strength": float(metrics["min_eigenvalue"]),
+            "fim_logdet": float(metrics["logdet"]),
+            "fim_min_eigenvalue": float(metrics["min_eigenvalue"]),
+            "fim_condition_number": float(metrics["condition_number"]),
+        }
+
+    def predict_target_best_response(self, uuv_center: np.ndarray | None = None) -> np.ndarray:
+        """Predict the target's next escape displacement away from a UUV center."""
+
+        self._require_state()
+        center = self.state.uuv_center if uuv_center is None else np.asarray(uuv_center, dtype=float)
+        direction = self._unit_vector(self.state.target_position - center)
+        horizontal = direction[:2]
+        if np.linalg.norm(horizontal) <= 1e-12:
+            horizontal = self.state.direction_gw[:2]
+        if np.linalg.norm(horizontal) <= 1e-12:
+            horizontal = np.array([1.0, 0.0], dtype=float)
+        horizontal = horizontal / max(np.linalg.norm(horizontal), 1e-12)
+        return np.array([horizontal[0], horizontal[1], 0.0], dtype=float) * self.target_speed * self.dt
+
+    def get_flow_condition_dict(self, coarse_action: int | None = None) -> Dict[str, np.ndarray | float]:
+        """Build named condition terms for conditional trajectory generation."""
+
+        self._require_state()
+        if coarse_action is None:
+            coarse_action = self.greedy_action_toward_target()
+        coarse_direction_xy = self.ACTION_DIRECTIONS[int(np.clip(coarse_action, 0, self.action_space_n - 1))]
+        connectivity = self.get_connectivity_metrics()
+        fim = self.compute_fim_metrics()
+        target_response = self.predict_target_best_response()
+        last_step_energy = float(self.history["energy"][-1]) if self.history.get("energy") else 0.0
+        remaining_mean = float(np.mean(self.state.uuv_energy))
+        budget = max(float(self.energy_budget), 1e-9)
+        return {
+            "uav_position": self.state.uav_position.copy(),
+            "usv_position": self.state.usv_position.copy(),
+            "uuv_center": self.state.uuv_center.copy(),
+            "target_belief_position": self._belief_target_position().copy(),
+            "target_belief_velocity": target_response.copy(),
+            "total_voyage_distance": float(self.state.total_voyage_distance),
+            "energy_metrics": np.array(
+                [self.state.total_energy_used / budget, remaining_mean / budget, last_step_energy / budget],
+                dtype=float,
+            ),
+            "connectivity_metrics": np.array(
+                [
+                    connectivity["us_ratio"],
+                    connectivity["sg_ratio"],
+                    connectivity["connected_fraction"],
+                    connectivity["uav_usv_probability"],
+                    connectivity["underwater_delta_bar"],
+                ],
+                dtype=float,
+            ),
+            "fim_metrics": np.array(
+                [fim["fim_trace"], fim["fim_trace_inv"], fim["fim_determinant"]],
+                dtype=float,
+            ),
+            "predicted_target_best_response": target_response.copy(),
+            "coarse_action_direction": np.array([coarse_direction_xy[0], coarse_direction_xy[1], 0.0], dtype=float),
+        }
+
+    def get_flow_condition_vector(self, coarse_action: int | None = None) -> np.ndarray:
+        """Return the fixed-order condition vector used by Flow Matching."""
+
+        condition = self.get_flow_condition_dict(coarse_action=coarse_action)
+        vector = np.concatenate(
+            [
+                condition["uav_position"],
+                condition["usv_position"],
+                condition["uuv_center"],
+                condition["target_belief_position"],
+                condition["target_belief_velocity"],
+                np.array([condition["total_voyage_distance"]], dtype=float),
+                condition["energy_metrics"],
+                condition["connectivity_metrics"],
+                condition["fim_metrics"],
+                condition["predicted_target_best_response"],
+                condition["coarse_action_direction"],
+            ]
+        )
+        return vector.astype(np.float32)
+
     def _initial_target_position(self) -> np.ndarray:
         configured = self.env_config.get("target_initial_position")
         if configured is not None:
@@ -396,6 +585,26 @@ class ThreeUEnv:
         self.state.target_position[2] = self.hunting_depth
         self.state.target_escaped = bool(escaped_boundary or self._target_distance() >= self.escape_distance)
 
+    def _move_target(self, target_decision: Dict[str, float]) -> None:
+        """Move the target with either the original heuristic or game response."""
+
+        if str(target_decision.get("target_motion_model", "simple")) != "intelligent":
+            self._move_target_away_from_group()
+            return
+
+        target_action = int(target_decision.get("target_best_response_action", 0))
+        if target_action >= self.action_space_n:
+            candidate = self.state.target_position.copy()
+        else:
+            move_xy = self.ACTION_DIRECTIONS[target_action] * self.target_speed * self.dt
+            candidate = self.state.target_position.copy()
+            candidate[:2] += move_xy
+
+        escaped_boundary = not self._xy_in_bounds(candidate)
+        self.state.target_position = self._clip_position(candidate)
+        self.state.target_position[2] = self.hunting_depth
+        self.state.target_escaped = bool(escaped_boundary or self._target_distance() >= self.escape_distance)
+
     def _compute_step_energy(self, actual_move: float) -> float:
         speed = actual_move / max(self.dt, 1e-12)
         per_uuv = self.energy_base * self.dt + self.energy_linear * actual_move + self.energy_quadratic * speed**2
@@ -407,18 +616,32 @@ class ThreeUEnv:
         connected_fraction = 0.5 * float(us_distance <= self.uav_usv_range) + 0.5 * float(
             sg_distance <= self.usv_uuv_range
         )
+        connectivity = self.get_connectivity_metrics()
+        fim_proxy = self.compute_fim_metrics()
         self.history["energy"].append(float(step_energy))
         self.history["us_distance"].append(us_distance)
         self.history["sg_distance"].append(sg_distance)
         self.history["connected_fraction"].append(connected_fraction)
+        self.history["uav_usv_probability"].append(float(connectivity["uav_usv_probability"]))
+        self.history["underwater_delta_bar"].append(float(connectivity["underwater_delta_bar"]))
+        self.history["fim_trace"].append(float(fim_proxy["fim_trace"]))
         self.history["target_distance"].append(self._target_distance())
+        trace_inv = float(self.current_fim_metrics.get("trace_inv", np.nan))
+        if not np.isfinite(trace_inv):
+            trace_inv = float(fim_proxy["fim_trace_inv"])
         self.history["fim_logdet"].append(float(self.current_fim_metrics.get("logdet", np.nan)))
-        self.history["fim_trace_inv"].append(float(self.current_fim_metrics.get("trace_inv", np.nan)))
+        self.history["fim_trace_inv"].append(trace_inv)
         self.history["fim_min_eigenvalue"].append(float(self.current_fim_metrics.get("min_eigenvalue", np.nan)))
         self.history["fim_condition_number"].append(float(self.current_fim_metrics.get("condition_number", np.nan)))
         self.history["belief_error"].append(float(self.current_belief_error))
         self.history["target_true_position"].append(self.state.target_position.copy())
         self.history["target_belief_position"].append(self._belief_target_position().copy())
+        game_info = self._last_game_step_info or self._default_game_info()
+        self.history["target_best_response_action"].append(float(game_info.get("target_best_response_action", -1.0)))
+        self.history["stackelberg_selected_action"].append(float(game_info.get("stackelberg_selected_action", -1.0)))
+        self.history["stackelberg_leader_cost"].append(float(game_info.get("stackelberg_leader_cost", 0.0)))
+        self.history["target_utility"].append(float(game_info.get("target_utility", 0.0)))
+        self.history["stackelberg_changed_action"].append(float(game_info.get("stackelberg_changed_action", 0.0)))
 
     def _build_info(self, reward: float, done: bool) -> Dict[str, float]:
         captured = self._target_captured()
@@ -431,7 +654,9 @@ class ThreeUEnv:
         connected_fraction = 0.5 * float(us_distance <= self.uav_usv_range) + 0.5 * float(
             sg_distance <= self.usv_uuv_range
         )
-        return {
+        connectivity = self.get_connectivity_metrics()
+        fim_proxy = self.compute_fim_metrics()
+        info = {
             "step": float(self.state.step_count),
             "reward": float(reward),
             "done": float(done),
@@ -450,8 +675,13 @@ class ThreeUEnv:
             "min_target_distance": target_distance,
             "connected_fraction": connected_fraction,
             "all_connected": float(connected_fraction == 1.0),
+            "uav_usv_probability": float(connectivity["uav_usv_probability"]),
+            "underwater_delta_bar": float(connectivity["underwater_delta_bar"]),
             "remaining_energy_mean": float(np.mean(self.state.uuv_energy)),
             "remaining_energy_min": float(np.min(self.state.uuv_energy)),
+            "fim_trace": float(fim_proxy["fim_trace"]),
+            "fim_trace_inv_proxy": float(fim_proxy["fim_trace_inv"]),
+            "fim_determinant_proxy": float(fim_proxy["fim_determinant"]),
             "fim_logdet": float(self.current_fim_metrics.get("logdet", np.nan)),
             "fim_trace_inv": float(self.current_fim_metrics.get("trace_inv", np.nan)),
             "fim_min_eigenvalue": float(self.current_fim_metrics.get("min_eigenvalue", np.nan)),
@@ -473,6 +703,11 @@ class ThreeUEnv:
             "use_fim": float(self.use_fim),
             "use_belief_state": float(self.use_belief_state),
         }
+        game_info = dict(self._last_game_step_info or self._default_game_info())
+        predicted_fim_trace_inv = game_info.pop("fim_trace_inv", np.nan)
+        game_info["stackelberg_predicted_fim_trace_inv"] = float(predicted_fim_trace_inv)
+        info.update(game_info)
+        return info
 
     def _update_sensing(self, initial: bool = False) -> None:
         """Update noisy target observation, belief, and FIM diagnostics."""
@@ -551,15 +786,23 @@ class ThreeUEnv:
         return self._clip_target_belief(estimate)
 
     def _fim_sensor_inputs(self, true_target: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        return self._fim_sensor_inputs_for(true_target, self.state.uuv_center)
+
+    def _fim_sensor_inputs_for(
+        self,
+        true_target: np.ndarray,
+        uuv_center: np.ndarray,
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
         sensor_positions = [self.state.uav_position.copy(), self.state.usv_position.copy()]
         noise_covariances = [
             self._range_bearing_covariance(true_target, self.state.uav_position, self.observation_noise_uav),
             self._range_bearing_covariance(true_target, self.state.usv_position, self.observation_noise_usv),
         ]
-        if self._target_distance() <= self.uuv_observation_range:
-            sensor_positions.append(self.state.uuv_center.copy())
+        candidate_center = np.asarray(uuv_center, dtype=float)
+        if self._distance(candidate_center, true_target) <= self.uuv_observation_range:
+            sensor_positions.append(candidate_center.copy())
             noise_covariances.append(
-                self._range_bearing_covariance(true_target, self.state.uuv_center, self.observation_noise_uuv)
+                self._range_bearing_covariance(true_target, candidate_center, self.observation_noise_uuv)
             )
         return sensor_positions, noise_covariances
 
@@ -603,22 +846,115 @@ class ThreeUEnv:
         return clipped
 
     def _select_executed_action(self, action: int) -> Dict[str, float]:
+        action = int(action)
+        game_selected_action = action
+        game_info = self._default_game_info(action)
+
+        if self.use_stackelberg:
+            from game.stackelberg import stackelberg_select_action
+
+            game_selected_action, game_info = stackelberg_select_action(
+                self,
+                None,
+                action,
+                self.config,
+                return_info=True,
+            )
+            game_selected_action = int(game_selected_action)
+
         if not self.use_lyapunov:
-            return {
-                "original_action": float(action),
-                "executed_action": float(action),
-                "action_replaced": 0.0,
-                "proposed_was_safe": 1.0,
-                "safety_filter_active": 0.0,
-            }
+            game_info.update(
+                {
+                    "original_action": float(action),
+                    "executed_action": float(game_selected_action),
+                    "action_replaced": float(action != game_selected_action),
+                    "proposed_was_safe": 1.0,
+                    "safety_filter_active": 0.0,
+                    "lyapunov_changed_action": 0.0,
+                }
+            )
+            return game_info
 
         from safety.lyapunov import select_safe_action
 
-        executed_action, safety_info = select_safe_action(self, action, range(self.action_space_n), self.config)
+        executed_action, safety_info = select_safe_action(self, game_selected_action, range(self.action_space_n), self.config)
         safety_info = dict(safety_info)
+        safety_info.update(game_info)
+        safety_info["original_action"] = float(action)
         safety_info["executed_action"] = float(executed_action)
         safety_info["safety_filter_active"] = 1.0
+        safety_info["action_replaced"] = float(int(executed_action) != action)
+        safety_info["lyapunov_changed_action"] = float(int(executed_action) != game_selected_action)
         return safety_info
+
+    def _select_target_response(self, executed_action: int, selection_info: Dict[str, float]) -> Dict[str, float]:
+        if not self.use_intelligent_target:
+            return self._default_game_info(executed_action)
+
+        from game.stackelberg import target_best_response_details
+
+        response = target_best_response_details(self, executed_action, self.config)
+        target_info = self._default_game_info(executed_action)
+        target_info.update(
+            {
+                "target_motion_model": "intelligent",
+                "target_best_response_action": float(response["target_action"]),
+                "target_utility": float(response["target_utility"]),
+                "target_uncertainty_score": float(response.get("uncertainty_score", 0.0)),
+                "target_weak_connectivity_score": float(response.get("weak_connectivity_score", 0.0)),
+                "target_boundary_penalty": float(response.get("target_boundary_penalty", 0.0)),
+                "fim_trace_inv": float(response.get("fim_trace_inv", self.current_fim_metrics.get("trace_inv", np.nan))),
+            }
+        )
+        for key in (
+            "stackelberg_active",
+            "stackelberg_proposed_action",
+            "stackelberg_selected_action",
+            "stackelberg_changed_action",
+            "stackelberg_leader_cost",
+            "stackelberg_energy_cost",
+            "stackelberg_connectivity_cost",
+            "stackelberg_information_cost",
+            "stackelberg_lyapunov_penalty",
+            "stackelberg_evaluated_actions",
+        ):
+            if key in selection_info:
+                target_info[key] = float(selection_info[key])
+        return target_info
+
+    def _merge_game_step_info(
+        self,
+        selection_info: Dict[str, float],
+        target_decision: Dict[str, float],
+    ) -> Dict[str, float]:
+        executed_action = int(selection_info.get("executed_action", target_decision.get("stackelberg_selected_action", 0)))
+        merged = self._default_game_info(executed_action)
+        allowed_keys = set(merged) | {"target_motion_model"}
+        merged.update({key: value for key, value in selection_info.items() if key in allowed_keys})
+        merged.update({key: value for key, value in target_decision.items() if key in allowed_keys})
+        if "fim_trace_inv" not in merged or not np.isfinite(float(merged.get("fim_trace_inv", np.nan))):
+            merged["fim_trace_inv"] = float(self.current_fim_metrics.get("trace_inv", np.nan))
+        return merged
+
+    def _default_game_info(self, action: int = -1) -> Dict[str, float]:
+        return {
+            "stackelberg_active": float(self.use_stackelberg),
+            "stackelberg_proposed_action": float(action),
+            "stackelberg_selected_action": float(action),
+            "stackelberg_changed_action": 0.0,
+            "stackelberg_leader_cost": 0.0,
+            "target_best_response_action": -1.0,
+            "target_utility": 0.0,
+            "target_uncertainty_score": 0.0,
+            "target_weak_connectivity_score": 0.0,
+            "target_boundary_penalty": 0.0,
+            "stackelberg_energy_cost": 0.0,
+            "stackelberg_connectivity_cost": 0.0,
+            "stackelberg_information_cost": 0.0,
+            "stackelberg_lyapunov_penalty": 0.0,
+            "stackelberg_evaluated_actions": 0.0,
+            "fim_trace_inv": float(self.current_fim_metrics.get("trace_inv", np.nan)),
+        }
 
     def _attach_reset_safety_info(self) -> None:
         from safety.lyapunov import lyapunov_value
@@ -693,6 +1029,21 @@ class ThreeUEnv:
 
     def _sg_distance(self) -> float:
         return self._distance(self.state.usv_position, self.state.uuv_center)
+
+    def _underwater_delta_bar(self, uuv_center: np.ndarray) -> float:
+        """Soft eigenvalue connectivity for the USV plus colocated UUV cluster."""
+
+        uuv_positions = np.repeat(np.asarray(uuv_center, dtype=float)[None, :], self.num_uuvs, axis=0)
+        nodes = np.vstack([self.state.usv_position, uuv_positions])
+        adjacency = np.zeros((nodes.shape[0], nodes.shape[0]), dtype=float)
+        for i in range(nodes.shape[0]):
+            for j in range(i + 1, nodes.shape[0]):
+                if self._distance(nodes[i], nodes[j]) <= self.usv_uuv_range:
+                    adjacency[i, j] = 1.0
+                    adjacency[j, i] = 1.0
+        eigenvalues = np.linalg.eigvalsh(adjacency)
+        max_eval = float(np.max(eigenvalues)) if eigenvalues.size else 0.0
+        return float(max_eval + np.log(np.mean(np.exp(eigenvalues - max_eval))))
 
     def _clip_position(self, position: np.ndarray) -> np.ndarray:
         clipped = np.asarray(position, dtype=float).copy()

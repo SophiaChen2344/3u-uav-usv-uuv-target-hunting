@@ -15,6 +15,7 @@ results/figures/*.png
 results/tables/*.csv
 results/tables/*.md
 results/checkpoints/*.pt
+results/datasets/*.npz
 
 # Do not commit the source paper PDF.
 *.pdf

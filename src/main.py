@@ -9,6 +9,7 @@ import yaml
 
 from experiments.compare_height import compare_uav_height
 from experiments.compare_speed import compare_uuv_speed
+from experiments.ablation_flow_matching import run_ablation as run_flow_matching_ablation
 from experiments.reproduce_table2 import reproduce_table2
 from experiments.run_aco import evaluate_aco
 from experiments.run_dqn import train_dqn
@@ -25,6 +26,12 @@ def main() -> None:
     parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config.")
     parser.add_argument("--episodes", type=int, default=None, help="Override DQN training episodes for this run.")
     parser.add_argument("--no-lyapunov", action="store_true", help="Disable the Lyapunov safety filter.")
+    parser.add_argument(
+        "--planner",
+        default="dqn",
+        choices=["dqn", "dqn_lyapunov", "dqn_fim_stackelberg_lyapunov", "flow_matching", "full"],
+        help="Planner mode. Non-DQN modes run the Flow Matching ablation pipeline.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -34,6 +41,18 @@ def main() -> None:
         config.setdefault("experiments", {}).setdefault("table2", {})["train_episodes"] = int(args.episodes)
     if args.no_lyapunov:
         config.setdefault("safety", {})["use_lyapunov"] = False
+
+    if args.planner in {"dqn_lyapunov", "dqn_fim_stackelberg_lyapunov", "flow_matching", "full"}:
+        print(f"Running planner ablation with requested planner mode: {args.planner}")
+        summary = run_flow_matching_ablation(
+            config,
+            train_episodes=args.episodes,
+            eval_episodes=config.get("experiments", {}).get("flow_matching_ablation", {}).get("eval_episodes", 5),
+            save_outputs=True,
+        )
+        print(summary.to_string(index=False))
+        print("Done. Flow Matching ablation outputs are in the results directory.")
+        return
 
     results = config.get("results", {})
     ensure_output_dirs(

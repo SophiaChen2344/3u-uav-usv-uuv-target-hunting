@@ -334,4 +334,8 @@ def _disable_trial_safety(env: Any) -> None:
     if hasattr(env, "safety_config"):
         env.safety_config = dict(getattr(env, "safety_config", {}) or {})
         env.safety_config["use_lyapunov"] = False
-
+    if hasattr(env, "use_stackelberg"):
+        env.use_stackelberg = False
+    if hasattr(env, "game_config"):
+        env.game_config = dict(getattr(env, "game_config", {}) or {})
+        env.game_config["use_stackelberg"] = False

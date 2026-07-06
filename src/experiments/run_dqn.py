@@ -218,6 +218,11 @@ def train_dqn(
             "avg_belief_error": _mean_finite(env.history.get("belief_error", [np.nan])),
             "use_fim": final_info.get("use_fim", 0.0),
             "use_belief_state": final_info.get("use_belief_state", 0.0),
+            "stackelberg_active": final_info.get("stackelberg_active", 0.0),
+            "stackelberg_changed_actions": _sum_finite(env.history.get("stackelberg_changed_action", [])),
+            "avg_stackelberg_leader_cost": _mean_finite(env.history.get("stackelberg_leader_cost", [np.nan])),
+            "avg_target_utility": _mean_finite(env.history.get("target_utility", [np.nan])),
+            "target_best_response_action": final_info.get("target_best_response_action", np.nan),
         }
         records.append(record)
 
@@ -299,6 +304,11 @@ def evaluate_agent(config: Dict, agent, episodes: int | None = None, seed_offset
                 "avg_belief_error": _mean_finite(env.history.get("belief_error", [np.nan])),
                 "use_fim": final_info.get("use_fim", 0.0),
                 "use_belief_state": final_info.get("use_belief_state", 0.0),
+                "stackelberg_active": final_info.get("stackelberg_active", 0.0),
+                "stackelberg_changed_actions": _sum_finite(env.history.get("stackelberg_changed_action", [])),
+                "avg_stackelberg_leader_cost": _mean_finite(env.history.get("stackelberg_leader_cost", [np.nan])),
+                "avg_target_utility": _mean_finite(env.history.get("target_utility", [np.nan])),
+                "target_best_response_action": final_info.get("target_best_response_action", np.nan),
             }
         )
     return pd.DataFrame.from_records(records)

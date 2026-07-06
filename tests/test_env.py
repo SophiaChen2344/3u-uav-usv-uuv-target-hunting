@@ -48,3 +48,44 @@ def test_environment_step_updates_energy_and_info() -> None:
     assert len(env.history["sg_distance"]) == 1
     assert len(env.history["target_distance"]) == 2
     assert 0.0 <= info["connected_fraction"] <= 1.0
+
+
+def test_environment_runs_with_fim_disabled_and_enabled() -> None:
+    disabled = load_test_config()
+    disabled["sensing"]["use_fim"] = False
+    disabled["sensing"]["use_belief_state"] = False
+    env_disabled = ThreeUEnv(disabled, seed=123)
+    obs_disabled = env_disabled.reset()
+    next_obs_disabled, _reward, _done, info_disabled = env_disabled.step(0)
+
+    enabled = load_test_config()
+    enabled["sensing"]["use_fim"] = True
+    enabled["sensing"]["use_belief_state"] = True
+    env_enabled = ThreeUEnv(enabled, seed=123)
+    obs_enabled = env_enabled.reset()
+    next_obs_enabled, _reward, _done, info_enabled = env_enabled.step(0)
+
+    assert obs_disabled.shape == obs_enabled.shape == (16,)
+    assert next_obs_disabled.shape == next_obs_enabled.shape == (16,)
+    assert np.isnan(info_disabled["fim_logdet"])
+    assert np.isfinite(info_enabled["fim_logdet"])
+    assert np.isfinite(info_enabled["belief_error"])
+
+
+def test_belief_state_hides_true_target_position_from_policy_state() -> None:
+    config = load_test_config()
+    config["sensing"]["use_fim"] = True
+    config["sensing"]["use_belief_state"] = True
+    config["sensing"]["observation_noise_uav"] = 30.0
+    config["sensing"]["observation_noise_usv"] = 25.0
+    config["sensing"]["observation_noise_uuv"] = 20.0
+
+    env = ThreeUEnv(config, seed=999)
+    observation = env.reset()
+
+    policy_target = observation[9:12]
+    true_target = env.state.target_position.astype(np.float32)
+    belief_target = env.state.belief_target_position.astype(np.float32)
+
+    assert np.allclose(policy_target, belief_target)
+    assert not np.allclose(policy_target, true_target)

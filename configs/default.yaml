@@ -68,6 +68,22 @@ safety:
   epsilon: 1.0
   fallback_mode: "least_unsafe"
 
+game:
+  use_stackelberg: true
+  use_intelligent_target: true
+  target_action_space: 8
+  horizon: 1
+  candidate_mode: "all"
+  w_target_dist: 1.0
+  w_target_info: 0.2
+  w_target_conn: 0.2
+  w_target_boundary: 1.0
+  w_leader_hunt: 1.0
+  w_leader_energy: 0.1
+  w_leader_comm: 0.2
+  w_leader_info: 0.1
+  w_leader_lyapunov: 1.0
+
 experiments:
   heights: [80.0, 120.0, 160.0, 200.0, 240.0]
   uuv_speeds: [6.0, 9.0, 12.0, 15.0, 18.0]
@@ -81,6 +97,9 @@ experiments:
     train_episodes: 12
     eval_episodes: 6
   lyapunov_ablation:
+    train_episodes: 12
+    eval_episodes: 6
+  stackelberg_ablation:
     train_episodes: 12
     eval_episodes: 6
   aco:

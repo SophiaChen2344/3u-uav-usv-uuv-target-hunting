@@ -6,9 +6,10 @@ implements a compact 3U simulator, energy and connectivity models, DQN-family
 controllers, an Ant Colony Optimization baseline, and experiment scripts for
 Fig. 2-like, Fig. 3-like, and Table II-like comparisons.
 
-The current version also includes a Lyapunov-inspired safety filter for UUV
-action selection. The filter is an educational one-step safety heuristic, not a
-formal proof of global stability.
+The current version also includes a one-step Stackelberg pursuit-evasion game
+for rational target motion and a Lyapunov-inspired safety filter for UUV action
+selection. These additions are educational approximations, not formal proofs or
+official paper code.
 
 ## Paper Citation
 
@@ -38,6 +39,9 @@ reproduction-style simulation results, not as exact paper results.
   optional acoustic communication term.
 - Connectivity model: UAV-USV connectivity and underwater USV-UUV graph
   connectivity are approximated from distances.
+- Stackelberg pursuit-evasion game: The DQN proposes a UUV action, the target
+  computes a best-response escape action, and the 3U leader can select a
+  lower-cost action before the Lyapunov filter is applied.
 - Lyapunov-inspired safety filter: Candidate UUV actions are screened with a
   scalar function that combines target distance, connectivity risk, energy
   imbalance risk, and boundary risk.
@@ -73,6 +77,8 @@ reproduction-style simulation results, not as exact paper results.
 |   |   |-- replay_buffer.py
 |   |   |-- plotting.py
 |   |   `-- seed.py
+|   |-- game/
+|   |   `-- stackelberg.py
 |   |-- safety/
 |   |   `-- lyapunov.py
 |   `-- experiments/
@@ -81,7 +87,8 @@ reproduction-style simulation results, not as exact paper results.
 |       |-- compare_height.py
 |       |-- compare_speed.py
 |       |-- reproduce_table2.py
-|       `-- ablation_lyapunov.py
+|       |-- ablation_lyapunov.py
+|       `-- ablation_stackelberg.py
 |-- results/
 |   |-- figures/
 |   |-- tables/
@@ -146,6 +153,12 @@ Run the Lyapunov safety ablation:
 python src/experiments/ablation_lyapunov.py
 ```
 
+Run the Stackelberg pursuit-evasion ablation:
+
+```bash
+python src/experiments/ablation_stackelberg.py
+```
+
 For a short smoke run of the main pipeline:
 
 ```bash
@@ -181,11 +194,17 @@ Common outputs include:
 - `table2_reproduction.csv`
 - `table2_reproduction.md`
 - `ablation_lyapunov.csv`
+- `ablation_stackelberg.csv`
 
 The Lyapunov ablation also writes:
 
 - `lyapunov_curve.png`
 - `lyapunov_ablation.png`
+
+The Stackelberg ablation also writes:
+
+- `stackelberg_distance_curve.png`
+- `stackelberg_success_rate.png`
 
 Model checkpoints are saved under:
 
@@ -202,6 +221,9 @@ results/checkpoints/
 - Exact numerical results may differ from the paper.
 - The ACO baseline is a standard grid-based approximation rather than an
   official baseline implementation.
+- The Stackelberg game is a one-step discrete best-response approximation; it
+  is designed to test the pursuit-evasion idea without making DQN training
+  prohibitively slow.
 - The Lyapunov module is a one-step safety filter inspired by Lyapunov
   decrease conditions. It is not a formal proof of global stability.
 
@@ -210,6 +232,7 @@ results/checkpoints/
 - Multi-target hunting.
 - More realistic UUV dynamics.
 - More intelligent target escape strategy.
+- Longer-horizon pursuit-evasion planning.
 - Multi-agent reinforcement learning.
 - Learned UAV and USV policies instead of simple scripted movement.
 

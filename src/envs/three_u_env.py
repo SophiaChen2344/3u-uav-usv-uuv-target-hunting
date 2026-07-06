@@ -5,7 +5,8 @@ This environment follows a compact abstraction of the 3U hunting problem:
 - one UAV monitors the 400 m x 400 m area from altitude ``h``;
 - one USV performs a random surface relay walk at ``z = 0``;
 - three UUVs are represented by a single underwater group center ``G``;
-- the target stays at the hunting depth and moves away from ``G``.
+- the target stays at the hunting depth and can either move away from ``G`` or
+  use a one-step Stackelberg best response.
 
 The API is intentionally Gym-like but does not depend on Gym/Gymnasium.
 """
@@ -145,6 +146,14 @@ class ThreeUEnv:
         self.uuv_observation_range = float(
             self.sensing_config.get("uuv_observation_range", self.env_config.get("sonar_radius", 130.0))
         )
+        self.game_config = dict(self.config.get("game", {}))
+        self.use_stackelberg = bool(self.game_config.get("use_stackelberg", False))
+        self.use_intelligent_target = bool(
+            self.game_config.get(
+                "use_intelligent_target",
+                self.use_stackelberg or str(self.game_config.get("target_model", "")).lower() == "intelligent",
+            )
+        )
 
         self.state: ThreeUState | None = None
         self.last_info: Dict[str, float] = {}
@@ -155,6 +164,7 @@ class ThreeUEnv:
         self.current_fim_metrics = self._empty_fim_metrics()
         self.current_belief_error = 0.0
         self.current_normalized_logdet = 0.0
+        self._last_game_step_info: Dict[str, float] = self._default_game_info()
 
     def seed(self, seed: int | None = None) -> list[int | None]:
         """Set the environment random seed."""
@@ -210,8 +220,14 @@ class ThreeUEnv:
             "original_action": [],
             "executed_action": [],
             "action_replaced": [],
+            "target_best_response_action": [],
+            "stackelberg_selected_action": [],
+            "stackelberg_leader_cost": [],
+            "target_utility": [],
+            "stackelberg_changed_action": [],
         }
         self._last_boundary_violation = False
+        self._last_game_step_info = self._default_game_info()
         self.last_info = self._build_info(reward=0.0, done=False)
         self._attach_reset_safety_info()
         return self.get_state()
@@ -226,6 +242,7 @@ class ThreeUEnv:
         previous_metrics = dict(self.last_info)
         selection_info = self._select_executed_action(action)
         action = int(selection_info.get("executed_action", action))
+        target_decision = self._select_target_response(action, selection_info)
 
         previous_center = self.state.uuv_center.copy()
         self.state.previous_target_distance = self._target_distance()
@@ -236,7 +253,7 @@ class ThreeUEnv:
         self.state.total_voyage_distance += actual_move
 
         self._move_usv_randomly()
-        self._move_target_away_from_group()
+        self._move_target(target_decision)
         self.state.direction_gw = self._unit_vector(self.state.target_position - self.state.uuv_center)
         self._update_sensing(initial=False)
 
@@ -252,6 +269,7 @@ class ThreeUEnv:
         self.state.step_count += 1
         done = bool(captured or escaped or self.state.step_count >= self.max_steps)
 
+        self._last_game_step_info = self._merge_game_step_info(selection_info, target_decision)
         self._append_logs(step_energy)
         info = self._build_info(reward=reward, done=done)
         self._attach_step_safety_info(
@@ -396,6 +414,26 @@ class ThreeUEnv:
         self.state.target_position[2] = self.hunting_depth
         self.state.target_escaped = bool(escaped_boundary or self._target_distance() >= self.escape_distance)
 
+    def _move_target(self, target_decision: Dict[str, float]) -> None:
+        """Move the target with either the original heuristic or game response."""
+
+        if str(target_decision.get("target_motion_model", "simple")) != "intelligent":
+            self._move_target_away_from_group()
+            return
+
+        target_action = int(target_decision.get("target_best_response_action", 0))
+        if target_action >= self.action_space_n:
+            candidate = self.state.target_position.copy()
+        else:
+            move_xy = self.ACTION_DIRECTIONS[target_action] * self.target_speed * self.dt
+            candidate = self.state.target_position.copy()
+            candidate[:2] += move_xy
+
+        escaped_boundary = not self._xy_in_bounds(candidate)
+        self.state.target_position = self._clip_position(candidate)
+        self.state.target_position[2] = self.hunting_depth
+        self.state.target_escaped = bool(escaped_boundary or self._target_distance() >= self.escape_distance)
+
     def _compute_step_energy(self, actual_move: float) -> float:
         speed = actual_move / max(self.dt, 1e-12)
         per_uuv = self.energy_base * self.dt + self.energy_linear * actual_move + self.energy_quadratic * speed**2
@@ -419,6 +457,12 @@ class ThreeUEnv:
         self.history["belief_error"].append(float(self.current_belief_error))
         self.history["target_true_position"].append(self.state.target_position.copy())
         self.history["target_belief_position"].append(self._belief_target_position().copy())
+        game_info = self._last_game_step_info or self._default_game_info()
+        self.history["target_best_response_action"].append(float(game_info.get("target_best_response_action", -1.0)))
+        self.history["stackelberg_selected_action"].append(float(game_info.get("stackelberg_selected_action", -1.0)))
+        self.history["stackelberg_leader_cost"].append(float(game_info.get("stackelberg_leader_cost", 0.0)))
+        self.history["target_utility"].append(float(game_info.get("target_utility", 0.0)))
+        self.history["stackelberg_changed_action"].append(float(game_info.get("stackelberg_changed_action", 0.0)))
 
     def _build_info(self, reward: float, done: bool) -> Dict[str, float]:
         captured = self._target_captured()
@@ -431,7 +475,7 @@ class ThreeUEnv:
         connected_fraction = 0.5 * float(us_distance <= self.uav_usv_range) + 0.5 * float(
             sg_distance <= self.usv_uuv_range
         )
-        return {
+        info = {
             "step": float(self.state.step_count),
             "reward": float(reward),
             "done": float(done),
@@ -473,6 +517,11 @@ class ThreeUEnv:
             "use_fim": float(self.use_fim),
             "use_belief_state": float(self.use_belief_state),
         }
+        game_info = dict(self._last_game_step_info or self._default_game_info())
+        predicted_fim_trace_inv = game_info.pop("fim_trace_inv", np.nan)
+        game_info["stackelberg_predicted_fim_trace_inv"] = float(predicted_fim_trace_inv)
+        info.update(game_info)
+        return info
 
     def _update_sensing(self, initial: bool = False) -> None:
         """Update noisy target observation, belief, and FIM diagnostics."""
@@ -603,22 +652,117 @@ class ThreeUEnv:
         return clipped
 
     def _select_executed_action(self, action: int) -> Dict[str, float]:
+        action = int(action)
+        game_selected_action = action
+        game_info = self._default_game_info(action)
+
+        if self.use_stackelberg:
+            from game.stackelberg import stackelberg_select_action
+
+            game_selected_action, game_info = stackelberg_select_action(
+                self,
+                None,
+                action,
+                self.config,
+                return_info=True,
+            )
+            game_selected_action = int(game_selected_action)
+
         if not self.use_lyapunov:
-            return {
-                "original_action": float(action),
-                "executed_action": float(action),
-                "action_replaced": 0.0,
-                "proposed_was_safe": 1.0,
-                "safety_filter_active": 0.0,
-            }
+            game_info.update(
+                {
+                    "original_action": float(action),
+                    "executed_action": float(game_selected_action),
+                    "action_replaced": float(action != game_selected_action),
+                    "proposed_was_safe": 1.0,
+                    "safety_filter_active": 0.0,
+                    "lyapunov_changed_action": 0.0,
+                }
+            )
+            return game_info
 
         from safety.lyapunov import select_safe_action
 
-        executed_action, safety_info = select_safe_action(self, action, range(self.action_space_n), self.config)
+        executed_action, safety_info = select_safe_action(
+            self, game_selected_action, range(self.action_space_n), self.config
+        )
         safety_info = dict(safety_info)
+        safety_info.update(game_info)
+        safety_info["original_action"] = float(action)
         safety_info["executed_action"] = float(executed_action)
         safety_info["safety_filter_active"] = 1.0
+        safety_info["action_replaced"] = float(int(executed_action) != action)
+        safety_info["lyapunov_changed_action"] = float(int(executed_action) != game_selected_action)
         return safety_info
+
+    def _select_target_response(self, executed_action: int, selection_info: Dict[str, float]) -> Dict[str, float]:
+        if not self.use_intelligent_target:
+            return self._default_game_info(executed_action)
+
+        from game.stackelberg import target_best_response_details
+
+        response = target_best_response_details(self, executed_action, self.config)
+        target_info = self._default_game_info(executed_action)
+        target_info.update(
+            {
+                "target_motion_model": "intelligent",
+                "target_best_response_action": float(response["target_action"]),
+                "target_utility": float(response["target_utility"]),
+                "target_uncertainty_score": float(response.get("uncertainty_score", 0.0)),
+                "target_weak_connectivity_score": float(response.get("weak_connectivity_score", 0.0)),
+                "target_boundary_penalty": float(response.get("target_boundary_penalty", 0.0)),
+                "fim_trace_inv": float(response.get("fim_trace_inv", self.current_fim_metrics.get("trace_inv", np.nan))),
+            }
+        )
+        for key in (
+            "stackelberg_active",
+            "stackelberg_proposed_action",
+            "stackelberg_selected_action",
+            "stackelberg_changed_action",
+            "stackelberg_leader_cost",
+            "stackelberg_energy_cost",
+            "stackelberg_connectivity_cost",
+            "stackelberg_information_cost",
+            "stackelberg_lyapunov_penalty",
+            "stackelberg_evaluated_actions",
+        ):
+            if key in selection_info:
+                target_info[key] = float(selection_info[key])
+        return target_info
+
+    def _merge_game_step_info(
+        self,
+        selection_info: Dict[str, float],
+        target_decision: Dict[str, float],
+    ) -> Dict[str, float]:
+        executed_action = int(selection_info.get("executed_action", target_decision.get("stackelberg_selected_action", 0)))
+        merged = self._default_game_info(executed_action)
+        allowed_keys = set(merged) | {"target_motion_model"}
+        merged.update({key: value for key, value in selection_info.items() if key in allowed_keys})
+        merged.update({key: value for key, value in target_decision.items() if key in allowed_keys})
+        if "fim_trace_inv" not in merged or not np.isfinite(float(merged.get("fim_trace_inv", np.nan))):
+            merged["fim_trace_inv"] = float(self.current_fim_metrics.get("trace_inv", np.nan))
+        return merged
+
+    def _default_game_info(self, action: int = -1) -> Dict[str, float]:
+        return {
+            "stackelberg_active": float(self.use_stackelberg),
+            "stackelberg_proposed_action": float(action),
+            "stackelberg_selected_action": float(action),
+            "stackelberg_changed_action": 0.0,
+            "stackelberg_leader_cost": 0.0,
+            "target_best_response_action": -1.0,
+            "target_utility": 0.0,
+            "target_uncertainty_score": 0.0,
+            "target_weak_connectivity_score": 0.0,
+            "target_boundary_penalty": 0.0,
+            "stackelberg_energy_cost": 0.0,
+            "stackelberg_connectivity_cost": 0.0,
+            "stackelberg_information_cost": 0.0,
+            "stackelberg_lyapunov_penalty": 0.0,
+            "stackelberg_evaluated_actions": 0.0,
+            "fim_trace_inv": float(self.current_fim_metrics.get("trace_inv", np.nan)),
+        }
 
     def _attach_reset_safety_info(self) -> None:
         from safety.lyapunov import lyapunov_value

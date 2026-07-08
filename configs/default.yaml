@@ -57,6 +57,33 @@ training:
   table_variant_episodes: 12
   progress_bar: true
 
+flow_matching:
+  use_flow_matching: true
+  horizon: 10
+  num_candidates: 16
+  hidden_dim: 256
+  num_layers: 3
+  batch_size: 128
+  epochs: 50
+  lr: 0.001
+  dataset_size: 5000
+  condition_dim_auto: true
+  trajectory_dim_auto: true
+  use_dqn_rollouts: true
+  use_heuristic_rollouts: true
+  use_aco_rollouts: false
+  noise_scale: 18.0
+  integration_steps: 20
+  gradient_clip: 5.0
+  scoring:
+    w_hunt: 1.0
+    w_energy: 0.001
+    w_comm: 3.0
+    w_info: 0.25
+    w_game: 0.5
+    w_lyapunov: 2.0
+    w_smooth: 0.05
+
 safety:
   use_lyapunov: true
   alpha_target: 1.0
@@ -78,6 +105,7 @@ sensing:
   info_reward_weight: 0.01
   belief_update_alpha: 0.35
   uuv_observation_range: 130.0
+
 game:
   use_stackelberg: true
   use_intelligent_target: true
@@ -115,6 +143,11 @@ experiments:
   stackelberg_ablation:
     train_episodes: 12
     eval_episodes: 6
+  flow_matching_ablation:
+    train_episodes: 8
+    eval_episodes: 5
+    dataset_size: 512
+    epochs: 5
   aco:
     episodes: 8
     grid_size: 25
@@ -131,3 +164,4 @@ results:
   figures: results/figures
   tables: results/tables
   checkpoints: results/checkpoints
+  datasets: results/datasets

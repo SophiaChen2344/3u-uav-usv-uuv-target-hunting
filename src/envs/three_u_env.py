@@ -71,7 +71,10 @@ class ThreeUEnv:
     """Simplified 3U target hunting simulator.
 
     State vector:
-        ``[U(t), S(t), G(t), W(t), direction_GW, total_voyage_distance]``
+        ``[U(t), S(t), G(t), W(t), direction_GW, total_voyage_distance]``.
+        When ``sensing.use_belief_state`` is true, ``W(t)`` and
+        ``direction_GW`` are computed from the noisy target belief rather than
+        the true target position.
 
     Action ids use eight compass directions for the UUV group center:
         0 east, 1 north-east, 2 north, 3 north-west,
@@ -205,6 +208,9 @@ class ThreeUEnv:
             "us_distance": [],
             "sg_distance": [],
             "connected_fraction": [],
+            "uav_usv_probability": [],
+            "underwater_delta_bar": [],
+            "fim_trace": [],
             "target_distance": [target_distance],
             "fim_logdet": [],
             "fim_trace_inv": [],
@@ -367,6 +373,171 @@ class ThreeUEnv:
         scores = self.ACTION_DIRECTIONS @ unit
         return int(np.argmax(scores))
 
+    def project_position(self, position: np.ndarray) -> np.ndarray:
+        """Project a 3D point into the square horizontal search region."""
+
+        return self._clip_position(np.asarray(position, dtype=float))
+
+    def project_trajectory(self, trajectory: np.ndarray) -> np.ndarray:
+        """Project one or many generated UUV-center trajectories into bounds."""
+
+        projected = np.asarray(trajectory, dtype=float).copy()
+        projected[..., 0] = np.clip(projected[..., 0], 0.0, self.area_size)
+        projected[..., 1] = np.clip(projected[..., 1], 0.0, self.area_size)
+        projected[..., 2] = self.uuv_initial_depth
+        return projected.astype(np.float32)
+
+    def trajectory_to_action(self, trajectory: np.ndarray) -> int:
+        """Convert the first segment of a continuous trajectory to an action id."""
+
+        self._require_state()
+        trajectory = np.asarray(trajectory, dtype=float)
+        if trajectory.ndim == 3:
+            trajectory = trajectory[0]
+        if trajectory.size == 0:
+            return self.greedy_action_toward_target()
+        first_point = trajectory.reshape(-1, 3)[0]
+        return self.action_from_vector(first_point[:2] - self.state.uuv_center[:2])
+
+    def get_connectivity_metrics(self) -> Dict[str, float]:
+        """Return distance-based communication diagnostics for planners."""
+
+        self._require_state()
+        us_distance = self._us_distance()
+        sg_distance = self._sg_distance()
+        us_ratio = us_distance / max(self.uav_usv_range, 1e-9)
+        sg_ratio = sg_distance / max(self.usv_uuv_range, 1e-9)
+        connected_fraction = 0.5 * float(us_ratio <= 1.0) + 0.5 * float(sg_ratio <= 1.0)
+        probability = float(np.exp(-np.clip(us_ratio**2, 0.0, 700.0)))
+        delta_bar = self._underwater_delta_bar(self.state.uuv_center)
+        return {
+            "us_distance": float(us_distance),
+            "sg_distance": float(sg_distance),
+            "us_ratio": float(us_ratio),
+            "sg_ratio": float(sg_ratio),
+            "connected_fraction": float(connected_fraction),
+            "uav_usv_probability": probability,
+            "underwater_delta_bar": float(delta_bar),
+        }
+
+    def compute_fim_metrics(self) -> Dict[str, float]:
+        """Return a stable FIM-style proxy for the current UUV/target geometry."""
+
+        self._require_state()
+        connectivity = self.get_connectivity_metrics()
+        comm_risk = connectivity["us_ratio"] ** 2 + connectivity["sg_ratio"] ** 2
+        return self.compute_fim_metrics_for(self.state.uuv_center, self._belief_target_position(), comm_risk=comm_risk)
+
+    def compute_fim_metrics_for(
+        self,
+        uuv_center: np.ndarray,
+        target_position: np.ndarray,
+        comm_risk: float = 0.0,
+    ) -> Dict[str, float]:
+        """Return FIM metrics for a candidate UUV-center/target geometry.
+
+        Flow-matching and Stackelberg helpers consume the older
+        ``fim_trace``/``fim_determinant`` keys, so this method preserves them
+        while computing the values from the range-bearing FIM module.
+        """
+
+        target = np.asarray(target_position, dtype=float)
+        candidate_center = np.asarray(uuv_center, dtype=float)
+        sensor_positions, noise_covariances = self._fim_sensor_inputs_for(target, candidate_center)
+        fim = fisher_information_matrix(target, sensor_positions, noise_covariances)
+        if comm_risk > 0.0:
+            fim = fim / (1.0 + max(float(comm_risk), 0.0))
+
+        metrics = fim_metrics(fim, regularization=self.fim_regularization)
+        trace = float(np.trace(fim + self.fim_regularization * np.eye(3, dtype=float)))
+        determinant = float(np.exp(np.clip(metrics["logdet"], -700.0, 700.0)))
+        return {
+            "fim_trace": trace,
+            "fim_trace_inv": float(metrics["trace_inv"]),
+            "fim_determinant": determinant,
+            "target_information_strength": float(metrics["min_eigenvalue"]),
+            "fim_logdet": float(metrics["logdet"]),
+            "fim_min_eigenvalue": float(metrics["min_eigenvalue"]),
+            "fim_condition_number": float(metrics["condition_number"]),
+        }
+
+    def predict_target_best_response(self, uuv_center: np.ndarray | None = None) -> np.ndarray:
+        """Predict the target's next escape displacement away from a UUV center."""
+
+        self._require_state()
+        center = self.state.uuv_center if uuv_center is None else np.asarray(uuv_center, dtype=float)
+        direction = self._unit_vector(self.state.target_position - center)
+        horizontal = direction[:2]
+        if np.linalg.norm(horizontal) <= 1e-12:
+            horizontal = self.state.direction_gw[:2]
+        if np.linalg.norm(horizontal) <= 1e-12:
+            horizontal = np.array([1.0, 0.0], dtype=float)
+        horizontal = horizontal / max(np.linalg.norm(horizontal), 1e-12)
+        return np.array([horizontal[0], horizontal[1], 0.0], dtype=float) * self.target_speed * self.dt
+
+    def get_flow_condition_dict(self, coarse_action: int | None = None) -> Dict[str, np.ndarray | float]:
+        """Build named condition terms for conditional trajectory generation."""
+
+        self._require_state()
+        if coarse_action is None:
+            coarse_action = self.greedy_action_toward_target()
+        coarse_direction_xy = self.ACTION_DIRECTIONS[int(np.clip(coarse_action, 0, self.action_space_n - 1))]
+        connectivity = self.get_connectivity_metrics()
+        fim = self.compute_fim_metrics()
+        target_response = self.predict_target_best_response()
+        last_step_energy = float(self.history["energy"][-1]) if self.history.get("energy") else 0.0
+        remaining_mean = float(np.mean(self.state.uuv_energy))
+        budget = max(float(self.energy_budget), 1e-9)
+        return {
+            "uav_position": self.state.uav_position.copy(),
+            "usv_position": self.state.usv_position.copy(),
+            "uuv_center": self.state.uuv_center.copy(),
+            "target_belief_position": self._belief_target_position().copy(),
+            "target_belief_velocity": target_response.copy(),
+            "total_voyage_distance": float(self.state.total_voyage_distance),
+            "energy_metrics": np.array(
+                [self.state.total_energy_used / budget, remaining_mean / budget, last_step_energy / budget],
+                dtype=float,
+            ),
+            "connectivity_metrics": np.array(
+                [
+                    connectivity["us_ratio"],
+                    connectivity["sg_ratio"],
+                    connectivity["connected_fraction"],
+                    connectivity["uav_usv_probability"],
+                    connectivity["underwater_delta_bar"],
+                ],
+                dtype=float,
+            ),
+            "fim_metrics": np.array(
+                [fim["fim_trace"], fim["fim_trace_inv"], fim["fim_determinant"]],
+                dtype=float,
+            ),
+            "predicted_target_best_response": target_response.copy(),
+            "coarse_action_direction": np.array([coarse_direction_xy[0], coarse_direction_xy[1], 0.0], dtype=float),
+        }
+
+    def get_flow_condition_vector(self, coarse_action: int | None = None) -> np.ndarray:
+        """Return the fixed-order condition vector used by Flow Matching."""
+
+        condition = self.get_flow_condition_dict(coarse_action=coarse_action)
+        vector = np.concatenate(
+            [
+                condition["uav_position"],
+                condition["usv_position"],
+                condition["uuv_center"],
+                condition["target_belief_position"],
+                condition["target_belief_velocity"],
+                np.array([condition["total_voyage_distance"]], dtype=float),
+                condition["energy_metrics"],
+                condition["connectivity_metrics"],
+                condition["fim_metrics"],
+                condition["predicted_target_best_response"],
+                condition["coarse_action_direction"],
+            ]
+        )
+        return vector.astype(np.float32)
+
     def _initial_target_position(self) -> np.ndarray:
         configured = self.env_config.get("target_initial_position")
         if configured is not None:
@@ -445,13 +616,21 @@ class ThreeUEnv:
         connected_fraction = 0.5 * float(us_distance <= self.uav_usv_range) + 0.5 * float(
             sg_distance <= self.usv_uuv_range
         )
+        connectivity = self.get_connectivity_metrics()
+        fim_proxy = self.compute_fim_metrics()
         self.history["energy"].append(float(step_energy))
         self.history["us_distance"].append(us_distance)
         self.history["sg_distance"].append(sg_distance)
         self.history["connected_fraction"].append(connected_fraction)
+        self.history["uav_usv_probability"].append(float(connectivity["uav_usv_probability"]))
+        self.history["underwater_delta_bar"].append(float(connectivity["underwater_delta_bar"]))
+        self.history["fim_trace"].append(float(fim_proxy["fim_trace"]))
         self.history["target_distance"].append(self._target_distance())
+        trace_inv = float(self.current_fim_metrics.get("trace_inv", np.nan))
+        if not np.isfinite(trace_inv):
+            trace_inv = float(fim_proxy["fim_trace_inv"])
         self.history["fim_logdet"].append(float(self.current_fim_metrics.get("logdet", np.nan)))
-        self.history["fim_trace_inv"].append(float(self.current_fim_metrics.get("trace_inv", np.nan)))
+        self.history["fim_trace_inv"].append(trace_inv)
         self.history["fim_min_eigenvalue"].append(float(self.current_fim_metrics.get("min_eigenvalue", np.nan)))
         self.history["fim_condition_number"].append(float(self.current_fim_metrics.get("condition_number", np.nan)))
         self.history["belief_error"].append(float(self.current_belief_error))
@@ -475,6 +654,8 @@ class ThreeUEnv:
         connected_fraction = 0.5 * float(us_distance <= self.uav_usv_range) + 0.5 * float(
             sg_distance <= self.usv_uuv_range
         )
+        connectivity = self.get_connectivity_metrics()
+        fim_proxy = self.compute_fim_metrics()
         info = {
             "step": float(self.state.step_count),
             "reward": float(reward),
@@ -494,8 +675,13 @@ class ThreeUEnv:
             "min_target_distance": target_distance,
             "connected_fraction": connected_fraction,
             "all_connected": float(connected_fraction == 1.0),
+            "uav_usv_probability": float(connectivity["uav_usv_probability"]),
+            "underwater_delta_bar": float(connectivity["underwater_delta_bar"]),
             "remaining_energy_mean": float(np.mean(self.state.uuv_energy)),
             "remaining_energy_min": float(np.min(self.state.uuv_energy)),
+            "fim_trace": float(fim_proxy["fim_trace"]),
+            "fim_trace_inv_proxy": float(fim_proxy["fim_trace_inv"]),
+            "fim_determinant_proxy": float(fim_proxy["fim_determinant"]),
             "fim_logdet": float(self.current_fim_metrics.get("logdet", np.nan)),
             "fim_trace_inv": float(self.current_fim_metrics.get("trace_inv", np.nan)),
             "fim_min_eigenvalue": float(self.current_fim_metrics.get("min_eigenvalue", np.nan)),
@@ -600,15 +786,23 @@ class ThreeUEnv:
         return self._clip_target_belief(estimate)
 
     def _fim_sensor_inputs(self, true_target: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        return self._fim_sensor_inputs_for(true_target, self.state.uuv_center)
+
+    def _fim_sensor_inputs_for(
+        self,
+        true_target: np.ndarray,
+        uuv_center: np.ndarray,
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
         sensor_positions = [self.state.uav_position.copy(), self.state.usv_position.copy()]
         noise_covariances = [
             self._range_bearing_covariance(true_target, self.state.uav_position, self.observation_noise_uav),
             self._range_bearing_covariance(true_target, self.state.usv_position, self.observation_noise_usv),
         ]
-        if self._target_distance() <= self.uuv_observation_range:
-            sensor_positions.append(self.state.uuv_center.copy())
+        candidate_center = np.asarray(uuv_center, dtype=float)
+        if self._distance(candidate_center, true_target) <= self.uuv_observation_range:
+            sensor_positions.append(candidate_center.copy())
             noise_covariances.append(
-                self._range_bearing_covariance(true_target, self.state.uuv_center, self.observation_noise_uuv)
+                self._range_bearing_covariance(true_target, candidate_center, self.observation_noise_uuv)
             )
         return sensor_positions, noise_covariances
 
@@ -683,9 +877,7 @@ class ThreeUEnv:
 
         from safety.lyapunov import select_safe_action
 
-        executed_action, safety_info = select_safe_action(
-            self, game_selected_action, range(self.action_space_n), self.config
-        )
+        executed_action, safety_info = select_safe_action(self, game_selected_action, range(self.action_space_n), self.config)
         safety_info = dict(safety_info)
         safety_info.update(game_info)
         safety_info["original_action"] = float(action)
@@ -837,6 +1029,21 @@ class ThreeUEnv:
 
     def _sg_distance(self) -> float:
         return self._distance(self.state.usv_position, self.state.uuv_center)
+
+    def _underwater_delta_bar(self, uuv_center: np.ndarray) -> float:
+        """Soft eigenvalue connectivity for the USV plus colocated UUV cluster."""
+
+        uuv_positions = np.repeat(np.asarray(uuv_center, dtype=float)[None, :], self.num_uuvs, axis=0)
+        nodes = np.vstack([self.state.usv_position, uuv_positions])
+        adjacency = np.zeros((nodes.shape[0], nodes.shape[0]), dtype=float)
+        for i in range(nodes.shape[0]):
+            for j in range(i + 1, nodes.shape[0]):
+                if self._distance(nodes[i], nodes[j]) <= self.usv_uuv_range:
+                    adjacency[i, j] = 1.0
+                    adjacency[j, i] = 1.0
+        eigenvalues = np.linalg.eigvalsh(adjacency)
+        max_eval = float(np.max(eigenvalues)) if eigenvalues.size else 0.0
+        return float(max_eval + np.log(np.mean(np.exp(eigenvalues - max_eval))))
 
     def _clip_position(self, position: np.ndarray) -> np.ndarray:
         clipped = np.asarray(position, dtype=float).copy()

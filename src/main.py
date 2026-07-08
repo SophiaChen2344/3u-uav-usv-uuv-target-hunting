@@ -7,12 +7,12 @@ from pathlib import Path
 
 import yaml
 
-from experiments.compare_height import compare_uav_height
-from experiments.compare_speed import compare_uuv_speed
-from experiments.ablation_flow_matching import run_ablation as run_flow_matching_ablation
-from experiments.reproduce_table2 import reproduce_table2
-from experiments.run_aco import evaluate_aco
-from experiments.run_dqn import train_dqn
+from experiments.ablations.ablation_flow_matching import run_ablation as run_flow_matching_ablation
+from experiments.baselines.run_aco import evaluate_aco
+from experiments.baselines.run_dqn import train_dqn
+from experiments.reproduction.reproduce_table2 import reproduce_table2
+from experiments.sensitivity.compare_height import compare_uav_height
+from experiments.sensitivity.compare_speed import compare_uuv_speed
 from utils.plotting import ensure_output_dirs
 
 

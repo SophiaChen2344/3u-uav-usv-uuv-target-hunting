@@ -12,11 +12,11 @@ from typing import Dict
 import pandas as pd
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from experiments.run_dqn import evaluate_agent, train_dqn
+from experiments.baselines.run_dqn import evaluate_agent, train_dqn
 from utils.plotting import save_dataframe, save_grouped_metric_curve
 
 

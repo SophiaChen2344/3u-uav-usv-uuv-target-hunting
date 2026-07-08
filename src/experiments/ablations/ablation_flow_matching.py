@@ -13,12 +13,12 @@ import numpy as np
 import pandas as pd
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from envs.three_u_env import ThreeUEnv
-from experiments.run_dqn import train_dqn
+from experiments.baselines.run_dqn import train_dqn
 from generative.flow_matching import FlowMatchingPlanner, train_flow_matching, trajectory_smoothness
 from generative.trajectory_dataset import build_trajectory_dataset
 from utils.plotting import (

@@ -12,6 +12,8 @@ rational target motion, a Lyapunov-inspired safety filter, and a lightweight
 Conditional Flow Matching trajectory proposal module. These additions are
 educational approximations, not formal proofs or official paper code.
 
+For a quick navigation guide, see [PROJECT_MAP.md](PROJECT_MAP.md).
+
 ## Paper Citation
 
 Wei Wei et al., "3U: Joint Design of UAV-USV-UUV Networks for Cooperative
@@ -97,15 +99,19 @@ reproduction-style simulation results, not as exact paper results.
 |   |-- safety/
 |   |   `-- lyapunov.py
 |   `-- experiments/
-|       |-- run_dqn.py
-|       |-- run_aco.py
-|       |-- compare_height.py
-|       |-- compare_speed.py
-|       |-- reproduce_table2.py
-|       |-- ablation_fim.py
-|       |-- ablation_flow_matching.py
-|       |-- ablation_lyapunov.py
-|       `-- ablation_stackelberg.py
+|       |-- baselines/
+|       |   |-- run_dqn.py
+|       |   `-- run_aco.py
+|       |-- sensitivity/
+|       |   |-- compare_height.py
+|       |   `-- compare_speed.py
+|       |-- reproduction/
+|       |   `-- reproduce_table2.py
+|       `-- ablations/
+|           |-- ablation_fim.py
+|           |-- ablation_flow_matching.py
+|           |-- ablation_lyapunov.py
+|           `-- ablation_stackelberg.py
 |-- results/
 |   |-- figures/
 |   |-- tables/
@@ -151,54 +157,54 @@ python src/main.py --config configs/default.yaml --planner full
 Train or evaluate DQN-family agents:
 
 ```bash
-python src/experiments/run_dqn.py
-python src/experiments/run_dqn.py --agent double_dqn
-python src/experiments/run_dqn.py --agent dueling_dqn
-python src/experiments/run_dqn.py --no-lyapunov
+python src/experiments/baselines/run_dqn.py
+python src/experiments/baselines/run_dqn.py --agent double_dqn
+python src/experiments/baselines/run_dqn.py --agent dueling_dqn
+python src/experiments/baselines/run_dqn.py --no-lyapunov
 ```
 
 Run the ACO baseline:
 
 ```bash
-python src/experiments/run_aco.py
+python src/experiments/baselines/run_aco.py
 ```
 
 Run Fig. 2-like and Fig. 3-like sensitivity experiments:
 
 ```bash
-python src/experiments/compare_height.py
-python src/experiments/compare_speed.py
+python src/experiments/sensitivity/compare_height.py
+python src/experiments/sensitivity/compare_speed.py
 ```
 
 Run the Table II-like reproduction:
 
 ```bash
-python src/experiments/reproduce_table2.py
+python src/experiments/reproduction/reproduce_table2.py
 ```
 
 Run the Lyapunov safety ablation:
 
 ```bash
-python src/experiments/ablation_lyapunov.py
+python src/experiments/ablations/ablation_lyapunov.py
 ```
 
 Run the FIM and noisy-belief ablation:
 
 ```bash
-python src/experiments/ablation_fim.py
+python src/experiments/ablations/ablation_fim.py
 ```
 
 Run the Stackelberg pursuit-evasion ablation:
 
 ```bash
-python src/experiments/ablation_stackelberg.py
+python src/experiments/ablations/ablation_stackelberg.py
 ```
 
 Train the Flow Matching trajectory generator and run its ablation:
 
 ```bash
 python src/generative/train_flow_matching.py --dataset-size 512 --epochs 5 --regenerate-dataset
-python src/experiments/ablation_flow_matching.py
+python src/experiments/ablations/ablation_flow_matching.py
 ```
 
 For a short smoke run of the main pipeline:

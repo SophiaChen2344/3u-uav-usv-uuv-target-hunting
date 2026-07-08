@@ -17,11 +17,11 @@ import numpy as np
 import pandas as pd
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from experiments.compare_height import (
+from experiments.sensitivity.compare_height import (
     DQN_LEARNING_RATES,
     _dqn_eval_for_setting,
     _save_distance_plot,
@@ -30,7 +30,7 @@ from experiments.compare_height import (
     _summarize_distances,
     _write_combined_fig3_results,
 )
-from experiments.run_aco import evaluate_aco
+from experiments.baselines.run_aco import evaluate_aco
 from utils.physics import knots_to_mps
 from utils.plotting import save_dataframe
 

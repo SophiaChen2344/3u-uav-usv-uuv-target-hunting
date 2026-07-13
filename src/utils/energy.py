@@ -141,6 +141,69 @@ def total_uuv_energy(
     return UuvEnergyBreakdown(motion=e_motion, communication=e_comm, total=e_motion + e_comm)
 
 
+def uuv_group_step_energy(
+    displacement: np.ndarray | float,
+    dt: float,
+    num_uuvs: int = 1,
+    communication_distance_m: float = 0.0,
+    connected: bool = True,
+    energy_config: Mapping[str, float | bool | str] | None = None,
+) -> UuvEnergyBreakdown:
+    """Return one-step energy for a formation-center UUV action.
+
+    Both the simulator and Flow Matching scoring call this helper so generated
+    trajectories and executed steps use the same energy model. The default
+    ``quadratic`` mode preserves the compact simulator's historical scale; set
+    ``model: physical`` to use the propulsion/acoustic formulas above.
+    """
+
+    cfg = dict(energy_config or {})
+    model = str(cfg.get("model", "quadratic")).lower()
+    n_uuvs = max(int(num_uuvs), 1)
+    dt = max(float(dt), 1e-12)
+    distance = safe_norm(np.asarray(displacement, dtype=float))
+    speed = distance / dt
+
+    if model in {"physical", "paper"}:
+        bits = float(cfg.get("bits_per_step", cfg.get("bits", 0.0)))
+        if not bool(connected):
+            bits = 0.0
+        per_uuv = total_uuv_energy(
+            velocity=speed,
+            travel_time=dt,
+            bits=bits,
+            communication_distance_m=float(communication_distance_m),
+            motion_only=bool(cfg.get("motion_only", False)),
+            energy_config=cfg,
+        )
+        return UuvEnergyBreakdown(
+            motion=float(n_uuvs * per_uuv.motion),
+            communication=float(n_uuvs * per_uuv.communication),
+            total=float(n_uuvs * per_uuv.total),
+        )
+
+    base = float(cfg.get("energy_base", cfg.get("base", 2.0))) * dt
+    linear = float(cfg.get("energy_linear", cfg.get("linear", 0.8))) * distance
+    quadratic = float(cfg.get("energy_quadratic", cfg.get("quadratic", 0.04))) * speed**2
+    motion = float(n_uuvs * (base + linear + quadratic))
+    communication = acoustic_comm_energy(
+        distance=float(communication_distance_m),
+        connected=bool(connected),
+        dt=dt,
+        bits_per_second=float(cfg.get("bits_per_second", 0.0)),
+        frequency_khz=float(cfg.get("frequency_khz", 10.0)),
+        circuit_energy_per_bit=float(cfg.get("circuit_energy_per_bit", cfg.get("E_u", 50e-9))),
+        q=float(cfg.get("q", 1e-12)),
+        bit_duration=float(cfg.get("bit_duration", cfg.get("T_b", 1e-3))),
+        spreading_factor=float(cfg.get("spreading_factor", 1.5)),
+        distance_in_km=bool(cfg.get("distance_in_km", False)),
+    )
+    communication *= n_uuvs
+    if bool(cfg.get("motion_only", True)):
+        communication = 0.0
+    return UuvEnergyBreakdown(motion=motion, communication=float(communication), total=float(motion + communication))
+
+
 def uuv_motion_energy(
     displacement: np.ndarray,
     dt: float,

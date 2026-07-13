@@ -42,8 +42,9 @@ def test_lyapunov_value_is_finite_and_nonnegative() -> None:
 
     assert np.isfinite(value)
     assert value >= 0.0
-    assert components["target_error"] >= 0.0
+    assert components["target_error"] == 0.0
     assert components["connectivity_risk"] >= 0.0
+    assert components["energy_shortfall_risk"] >= 0.0
 
 
 def test_lyapunov_delta_and_transition_condition_return_scalars() -> None:
@@ -97,10 +98,8 @@ def test_boundary_risk_increases_near_edges() -> None:
     center_state = env.reset()
     edge_state = deepcopy(center_state)
     edge_state[6:8] = np.array([5.0, 5.0])
-    edge_state[9:11] = np.array([395.0, 395.0])
 
     center_components = lyapunov_components(center_state, env.last_info, config)
     edge_components = lyapunov_components(edge_state, env.last_info, config)
 
     assert edge_components["boundary_risk"] > center_components["boundary_risk"]
-

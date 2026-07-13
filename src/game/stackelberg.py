@@ -1,12 +1,12 @@
 """One-step Stackelberg pursuit-evasion game for the 3U simulator.
 
-The leader is the 3U hunting system, represented by the UUV group-center
-action. The follower is the underwater target, which observes the leader's
-candidate action and chooses an escape action that maximizes a simple utility.
+The leader action is supplied by the trajectory generator or policy. This
+module predicts the underwater target follower's escape response after
+observing that action; it does not replace the leader action.
 
 This is an approximate educational model. It intentionally uses a cheap
-one-step rollout so DQN training remains practical while still replacing the
-old purely reactive "move away from the UUV" target rule with a rational
+one-step rollout so simulation remains practical while still replacing the old
+purely reactive "move away from the UUV" target rule with a rational
 best-response target.
 """
 
@@ -15,6 +15,8 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, Tuple
 
 import numpy as np
+
+from utils.energy import uuv_group_step_energy
 
 
 TARGET_STAY_ACTION = 8
@@ -49,41 +51,27 @@ def stackelberg_select_action(
     config: Dict[str, Any] | None,
     return_info: bool = False,
 ) -> int | Tuple[int, Dict[str, float]]:
-    """Select the leader action with the lowest Stackelberg leader cost.
+    """Return ``proposed_action`` plus target-response diagnostics.
 
-    ``proposed_action`` is the action from the DQN policy. Depending on the
-    configuration, the game layer evaluates either all actions or a compact
-    neighborhood around that proposal. The target best response is computed for
-    each leader candidate.
+    This compatibility function used to reselect the 3U leader action. The
+    integrated model now treats Flow Matching or the caller as the sole leader
+    action source; Stackelberg only predicts the target follower response for
+    that supplied action.
     """
 
     proposed_action = _action_to_int(proposed_action)
-    actions = _leader_candidates(env, candidate_actions, proposed_action, config)
-
-    evaluated: list[Dict[str, Any]] = []
-    for action in actions:
-        response = target_best_response_details(env, action, config)
-        leader = evaluate_leader_action_details(env, action, response, config)
-        evaluated.append({**response, **leader})
-
-    if not evaluated:
+    if not bool(_game_config(config).get("use_stackelberg", True)):
         info = _disabled_info(proposed_action)
         return (proposed_action, info) if return_info else proposed_action
 
-    chosen = min(
-        evaluated,
-        key=lambda item: (
-            float(item["leader_cost"]),
-            0 if int(item["leader_action"]) == proposed_action else 1,
-            _circular_action_distance(int(item["leader_action"]), proposed_action),
-        ),
-    )
-    selected_action = int(chosen["leader_action"])
+    response = target_best_response_details(env, proposed_action, config)
+    leader = evaluate_leader_action_details(env, proposed_action, response, config)
+    chosen = {**response, **leader}
     info = {
         "stackelberg_active": 1.0,
         "stackelberg_proposed_action": float(proposed_action),
-        "stackelberg_selected_action": float(selected_action),
-        "stackelberg_changed_action": float(selected_action != proposed_action),
+        "stackelberg_selected_action": float(proposed_action),
+        "stackelberg_changed_action": 0.0,
         "stackelberg_leader_cost": float(chosen["leader_cost"]),
         "target_best_response_action": float(chosen["target_action"]),
         "target_utility": float(chosen["target_utility"]),
@@ -95,9 +83,9 @@ def stackelberg_select_action(
         "stackelberg_information_cost": float(chosen["information_cost"]),
         "stackelberg_lyapunov_penalty": float(chosen["lyapunov_violation_penalty"]),
         "fim_trace_inv": float(chosen["fim_trace_inv"]),
-        "stackelberg_evaluated_actions": float(len(evaluated)),
+        "stackelberg_evaluated_actions": 1.0,
     }
-    return (selected_action, info) if return_info else selected_action
+    return (proposed_action, info) if return_info else proposed_action
 
 
 def simulate_one_step(env: Any, uuv_action: int, target_action: int) -> Dict[str, Any]:
@@ -238,16 +226,21 @@ def approximate_fim_trace_inv(
     uuv_position: np.ndarray | None = None,
     config: Dict[str, Any] | None = None,
 ) -> float:
-    """Approximate inverse Fisher-information trace.
+    """Return inverse FIM trace from the environment's range-bearing model.
 
-    A full FIM derivation would require a sensor model that the public paper
-    description does not fully specify. This proxy decreases as the target is
-    close to the UUV search center, the USV relay, and the UAV footprint.
+    The fallback below is retained for legacy callers that do not expose
+    ``compute_fim_metrics_for``.
     """
 
     _require_state(env)
     target = np.asarray(target_position if target_position is not None else env.state.target_position, dtype=float)
     uuv = np.asarray(uuv_position if uuv_position is not None else env.state.uuv_center, dtype=float)
+    if hasattr(env, "compute_fim_metrics_for"):
+        try:
+            return float(env.compute_fim_metrics_for(uuv, target).get("fim_trace_inv", 0.0))
+        except Exception:
+            pass
+
     usv = np.asarray(env.state.usv_position, dtype=float)
     uav = np.asarray(env.state.uav_position, dtype=float)
 
@@ -262,34 +255,6 @@ def approximate_fim_trace_inv(
     uav_strength = 0.25 / (1.0 + (uav_xy_distance / footprint) ** 2)
     strength = regularization + uuv_strength + usv_strength + uav_strength
     return float(1.0 / max(strength, EPS))
-
-
-def _leader_candidates(
-    env: Any,
-    candidate_actions: Iterable[int] | None,
-    proposed_action: int,
-    config: Dict[str, Any] | None,
-) -> list[int]:
-    action_count = int(getattr(env, "action_space_n", 8))
-    game = _game_config(config)
-    mode = str(game.get("candidate_mode", "all")).lower()
-
-    if candidate_actions is None:
-        if mode == "nearby":
-            raw_actions = [proposed_action - 1, proposed_action, proposed_action + 1]
-        else:
-            raw_actions = list(range(action_count))
-    else:
-        raw_actions = list(candidate_actions)
-        if proposed_action not in raw_actions:
-            raw_actions.insert(0, proposed_action)
-
-    actions: list[int] = []
-    for action in raw_actions:
-        normalized = _action_to_int(action) % action_count
-        if normalized not in actions:
-            actions.append(normalized)
-    return actions
 
 
 def _target_actions(config: Dict[str, Any] | None) -> list[int]:
@@ -341,13 +306,22 @@ def _weak_connectivity_score(
 
 
 def _leader_energy_cost(env: Any, sim: Dict[str, Any]) -> float:
-    actual_move = float(sim["uuv_move_distance"])
-    dt = max(float(getattr(env, "dt", 1.0)), EPS)
-    speed = actual_move / dt
-    base = float(getattr(env, "energy_base", 2.0)) * dt
-    linear = float(getattr(env, "energy_linear", 0.8)) * actual_move
-    quadratic = float(getattr(env, "energy_quadratic", 0.04)) * speed**2
-    return float(max(int(getattr(env, "num_uuvs", 3)), 1) * (base + linear + quadratic))
+    env_cfg = _env_config(getattr(env, "config", None))
+    uav_usv_range = max(float(getattr(env, "uav_usv_range", env_cfg.get("uav_usv_range", 700.0))), 1.0)
+    usv_uuv_range = max(float(getattr(env, "usv_uuv_range", env_cfg.get("usv_uuv_range", 700.0))), 1.0)
+    connected = (
+        _distance(env.state.uav_position, env.state.usv_position) <= uav_usv_range
+        and _distance(env.state.usv_position, sim["uuv_next"]) <= usv_uuv_range
+    )
+    breakdown = uuv_group_step_energy(
+        displacement=float(sim["uuv_move_distance"]),
+        dt=max(float(getattr(env, "dt", 1.0)), EPS),
+        num_uuvs=max(int(getattr(env, "num_uuvs", 3)), 1),
+        communication_distance_m=_distance(env.state.usv_position, sim["uuv_next"]),
+        connected=connected,
+        energy_config=getattr(env, "energy_config", None),
+    )
+    return float(breakdown.total)
 
 
 def _connectivity_cost(env: Any, uuv_next: np.ndarray, config: Dict[str, Any] | None) -> float:
@@ -496,11 +470,6 @@ def _safe_unit(vector: np.ndarray) -> np.ndarray:
     if norm <= EPS:
         return np.zeros_like(vector, dtype=float)
     return vector / norm
-
-
-def _circular_action_distance(a: int, b: int, n: int = 8) -> int:
-    delta = abs(int(a) - int(b)) % n
-    return int(min(delta, n - delta))
 
 
 def _action_to_int(action: Any) -> int:

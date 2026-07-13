@@ -1,4 +1,4 @@
-"""Game-theoretic planning helpers for the 3U simulator."""
+"""Target-response prediction helpers for the 3U simulator."""
 
 from .stackelberg import (
     approximate_fim_trace_inv,

@@ -14,14 +14,16 @@ methods, safety/sensing/game extensions, and reproducible experiments.
 
 - `src/agents/` contains DQN-family agents and the ACO baseline planner.
 - `src/models/` contains neural network modules used by the agents.
-- `src/generative/` contains the Conditional Flow Matching trajectory proposal
-  model and synthetic trajectory dataset builder.
+- `src/generative/` contains the Conditional Flow Matching formation-center
+  trajectory generator and synthetic trajectory dataset builder.
 
 ## Safety, Sensing, And Game Layers
 
-- `src/safety/` contains the Lyapunov-inspired action filter.
+- `src/safety/` contains the Lyapunov-inspired boundary/connectivity/energy
+  risk filter.
 - `src/sensing/` contains Fisher Information Matrix and belief-state helpers.
-- `src/game/` contains the one-step Stackelberg pursuit-evasion layer.
+- `src/game/` contains the one-step Stackelberg target-response prediction
+  layer.
 
 ## Experiments
 
@@ -40,4 +42,3 @@ Experiments are grouped by purpose under `src/experiments/`:
 - `results/datasets/` stores generated trajectory datasets.
 
 Generated artifacts are ignored by Git except for `.gitkeep` placeholders.
-

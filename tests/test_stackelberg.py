@@ -45,11 +45,14 @@ def test_stackelberg_select_action_returns_valid_action() -> None:
     env = ThreeUEnv(config, seed=123)
     env.reset()
 
-    selected, info = stackelberg_select_action(env, range(env.action_space_n), 0, config, return_info=True)
+    proposed = 0
+    selected, info = stackelberg_select_action(env, range(env.action_space_n), proposed, config, return_info=True)
 
     assert 0 <= selected < env.action_space_n
+    assert selected == proposed
     assert info["stackelberg_active"] == 1.0
-    assert info["stackelberg_evaluated_actions"] <= env.action_space_n
+    assert info["stackelberg_changed_action"] == 0.0
+    assert info["stackelberg_evaluated_actions"] == 1.0
 
 
 def test_disabled_game_matches_original_target_motion() -> None:

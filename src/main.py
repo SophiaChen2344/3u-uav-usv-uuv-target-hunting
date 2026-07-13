@@ -28,9 +28,9 @@ def main() -> None:
     parser.add_argument("--no-lyapunov", action="store_true", help="Disable the Lyapunov safety filter.")
     parser.add_argument(
         "--planner",
-        default="dqn",
+        default="full",
         choices=["dqn", "dqn_lyapunov", "dqn_fim_stackelberg_lyapunov", "flow_matching", "full"],
-        help="Planner mode. Non-DQN modes run the Flow Matching ablation pipeline.",
+        help="Planner mode. Default full mode uses Flow Matching as the primary trajectory generator.",
     )
     args = parser.parse_args()
 

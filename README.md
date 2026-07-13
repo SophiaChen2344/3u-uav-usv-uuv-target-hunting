@@ -36,27 +36,29 @@ reproduction-style simulation results, not as exact paper results.
   height.
 - USV relay: The USV moves on the sea surface and acts as a communication relay
   between aerial and underwater agents.
-- UUV target hunting: The UUV team is represented by a group center that moves
-  in eight discrete horizontal directions.
+- UUV target hunting: The UUV team is represented by a formation center that
+  moves in eight discrete horizontal directions; this is formation-center
+  planning, not independent multi-UUV control.
 - Energy model: UUV energy includes propulsion-oriented motion energy and an
   optional acoustic communication term.
 - Connectivity model: UAV-USV connectivity and underwater USV-UUV graph
   connectivity are approximated from distances.
 - Sensing and belief model: UAV, USV, and UUV-center observations are noisy,
-  and the DQN can use a fused target-position belief instead of the true target
-  position.
+  and planners/agents use a fused target-position belief instead of the true
+  target position when belief state is enabled.
 - Fisher Information Matrix: A range-bearing FIM estimates how informative the
   current platform geometry is for 3D target-position estimation.
-- Stackelberg pursuit-evasion game: The DQN proposes a UUV action, the target
-  computes a best-response escape action, and the 3U leader can select a
-  lower-cost action before the Lyapunov filter is applied.
-- Lyapunov-inspired safety filter: Candidate UUV actions are screened with a
-  scalar function that combines target distance, connectivity risk, energy
-  imbalance risk, and boundary risk.
+- Stackelberg pursuit-evasion game: The trajectory generator supplies the UUV
+  action, and Stackelberg only predicts the target best-response escape action;
+  it does not reselect or overwrite the UUV control action.
+- Lyapunov-inspired safety filter: Candidate UUV actions are screened only for
+  safety risks such as boundary violation, relay-chain breakage, and low
+  remaining energy. It does not include a target-distance tracking term.
 - Conditional Flow Matching: A small MLP vector field generates smooth
-  short-horizon UUV-center trajectory candidates conditioned on state, target
-  belief, energy, connectivity, FIM, and predicted target response metrics.
-- DQN / Double DQN / Dueling DQN: PyTorch agents learn UUV group-center
+  short-horizon formation-center trajectories as the integrated planner's
+  primary trajectory generator, conditioned on state, target belief, energy,
+  connectivity, FIM, and predicted target response metrics.
+- DQN / Double DQN / Dueling DQN: PyTorch agents learn UUV formation-center
   trajectory decisions.
 - ACO baseline: A grid-based Ant Colony Optimization planner provides a
   classical path-planning comparison.
@@ -283,7 +285,9 @@ results/datasets/
 
 - Some details are approximated because the paper does not release official
   code.
-- The UUV team is represented by a cluster center.
+- The UUV team is represented by a formation center. The simulator does not
+  claim independent multi-UUV positions, energies, actions, or communication
+  links unless that abstraction is explicitly extended.
 - The USV movement and target escape behavior are simplified.
 - The sensing model uses a compact Gaussian range-bearing approximation rather
   than a calibrated physical sensor stack.
@@ -295,13 +299,13 @@ results/datasets/
 - The Flow Matching generator is trained on synthetic trajectories from DQN
   rollouts, ACO-style paths, heuristic pursuit, and safety-filtered simulator
   rollouts because no official expert trajectory dataset is available.
-- Flow Matching currently acts as a proposal generator; it does not replace
-  the DQN controller by default.
+- Flow Matching is the default integrated trajectory generator. DQN-family
+  agents remain available as baselines or coarse-action conditioners.
 - Exact numerical results may differ from the paper.
 - The ACO baseline is a standard grid-based approximation rather than an
   official baseline implementation.
-- The Lyapunov module is a one-step safety filter inspired by Lyapunov
-  decrease conditions. It is not a formal proof of global stability.
+- The Lyapunov module is a one-step risk filter for boundary, connectivity,
+  and energy safety. It is not a formal proof of global stability.
 
 ## Future Work
 

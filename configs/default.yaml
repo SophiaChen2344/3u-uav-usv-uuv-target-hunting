@@ -19,9 +19,9 @@ environment:
   escape_distance: 288.0
   cooperative_capture_count: 2
   sonar_radius: 130.0
-  uuv_acoustic_range: 700.0
-  usv_uuv_range: 700.0
-  uav_usv_range: 700.0
+  uuv_acoustic_range: 160.0
+  usv_uuv_range: 160.0
+  uav_usv_range: 180.0
   camera_fov_deg: 70.0
   min_camera_radius: 120.0
   uuv_energy_budget: 65000.0
@@ -84,15 +84,25 @@ flow_matching:
     w_lyapunov: 2.0
     w_smooth: 0.05
 
+energy:
+  model: quadratic
+  energy_base: 2.0
+  energy_linear: 0.8
+  energy_quadratic: 0.04
+  motion_only: true
+
 safety:
   use_lyapunov: true
-  alpha_target: 1.0
+  alpha_target: 0.0
   alpha_formation: 0.0
   alpha_conn: 0.5
   alpha_energy: 0.2
   alpha_boundary: 0.2
-  c: 0.001
+  c: 0.0
   epsilon: 1.0
+  risk_tolerance: 1.0
+  energy_reserve_fraction: 0.05
+  boundary_margin: 40.0
   fallback_mode: "least_unsafe"
 
 sensing:
@@ -111,7 +121,6 @@ game:
   use_intelligent_target: true
   target_action_space: 8
   horizon: 1
-  candidate_mode: "all"
   w_target_dist: 1.0
   w_target_info: 0.2
   w_target_conn: 0.2

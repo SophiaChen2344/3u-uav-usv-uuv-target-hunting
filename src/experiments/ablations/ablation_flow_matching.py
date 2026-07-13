@@ -148,6 +148,7 @@ def run_ablation(
     base_dqn_config = _planner_config(config, use_lyapunov=False, use_fim=False, use_stackelberg=False)
     safe_dqn_config = _planner_config(config, use_lyapunov=True, use_fim=False, use_stackelberg=False)
     full_dqn_config = _planner_config(config, use_lyapunov=True, use_fim=True, use_stackelberg=True)
+    flow_condition_config = _planner_config(config, use_lyapunov=False, use_fim=True, use_stackelberg=False)
     for run_config in (base_dqn_config, safe_dqn_config, full_dqn_config):
         run_config.setdefault("training", {})["episodes"] = train_episodes
         run_config.setdefault("training", {})["progress_bar"] = False
@@ -191,7 +192,7 @@ def run_ablation(
             None,
             full_training_time,
         ),
-        ("Flow Matching only", base_dqn_config, "flow_matching", None, flow_model, flow_training_time),
+        ("Flow Matching only", flow_condition_config, "flow_matching", None, flow_model, flow_training_time),
         (
             "Flow Matching + FIM + Stackelberg + Lyapunov",
             full_dqn_config,

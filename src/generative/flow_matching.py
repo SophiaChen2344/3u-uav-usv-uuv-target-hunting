@@ -20,8 +20,8 @@ from torch import nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
 
-from safety.lyapunov import lyapunov_value
-from utils.energy import motion_energy
+from safety.lyapunov import is_safe_transition, lyapunov_value
+from utils.energy import uuv_group_step_energy
 from utils.physics import distance, safe_norm, safe_unit_vector
 
 
@@ -218,7 +218,7 @@ def train_flow_matching(
     """Train the conditional vector field with the CFM objective.
 
     The synthetic dataset stores absolute future UUV-center positions. Noisy
-    start trajectories are sampled around the current group center stored in
+    start trajectories are sampled around the current formation center stored in
     the condition vector, then linearly interpolated toward the target
     trajectory.
     """
@@ -318,7 +318,7 @@ def heuristic_candidate_trajectories(
 
     trajectories = []
     current = env.state.uuv_center.copy()
-    target = env.state.target_position.copy()
+    target = _planning_target_position(env).copy()
     speed = float(env.uuv_speed) * float(env.dt)
     target_step = float(env.target_speed) * float(env.dt)
     coarse_direction = _coarse_direction(env, coarse_action)
@@ -378,7 +378,7 @@ def predict_target_response(env: Any, trajectory: np.ndarray) -> np.ndarray:
     escape dynamics used by the environment.
     """
 
-    target = env.state.target_position.copy()
+    target = _planning_target_position(env).copy()
     responses = []
     step = float(env.target_speed) * float(env.dt)
     for center in np.asarray(trajectory, dtype=float):
@@ -415,15 +415,30 @@ def score_candidate_trajectory(
     }
 
     projected = env.project_trajectory(np.asarray(trajectory, dtype=float))
+    planning_target = _planning_target_position(env)
     target_path = predict_target_response(env, projected) if use_stackelberg else np.repeat(
-        env.state.target_position[None, :], projected.shape[0], axis=0
+        planning_target[None, :], projected.shape[0], axis=0
     )
     final_distance = distance(projected[-1], target_path[-1])
 
     positions = np.vstack([env.state.uuv_center[None, :], projected])
     displacements = np.diff(positions, axis=0)
-    speeds = np.linalg.norm(displacements, axis=1) / max(float(env.dt), 1e-12)
-    energy_cost = float(sum(motion_energy(speed, env.dt) for speed in speeds))
+    energy_cost = 0.0
+    step_energies: list[float] = []
+    energy_config = getattr(env, "energy_config", dict((config or {}).get("energy", {})))
+    for step_idx, displacement in enumerate(displacements):
+        center_after_step = positions[step_idx + 1]
+        connected = distance(env.state.usv_position, center_after_step) <= max(float(env.usv_uuv_range), 1e-9)
+        step_energy = uuv_group_step_energy(
+            displacement=displacement,
+            dt=env.dt,
+            num_uuvs=getattr(env, "num_uuvs", 1),
+            communication_distance_m=distance(env.state.usv_position, center_after_step),
+            connected=connected,
+            energy_config=energy_config,
+        ).total
+        step_energies.append(float(step_energy))
+        energy_cost += float(step_energy)
 
     comm_risks = []
     info_costs = []
@@ -432,8 +447,13 @@ def score_candidate_trajectory(
     previous_state = env.get_state().copy()
     previous_metrics = dict(env.last_info)
     previous_value = lyapunov_value(previous_state, previous_metrics, config)
+    predicted_total_energy = float(getattr(env.state, "total_energy_used", 0.0))
+    energy_budget = max(float(getattr(env.state, "energy_budget", getattr(env, "energy_budget", 65_000.0))), 1e-9)
+    num_uuvs = max(int(getattr(env, "num_uuvs", 1)), 1)
 
-    for center, target in zip(projected, target_path):
+    for step_idx, (center, target) in enumerate(zip(projected, target_path)):
+        predicted_total_energy += step_energies[step_idx] if step_idx < len(step_energies) else 0.0
+        remaining_per_uuv = max(0.0, energy_budget - predicted_total_energy / num_uuvs)
         us_distance = distance(env.state.uav_position, env.state.usv_position)
         sg_distance = distance(env.state.usv_position, center)
         us_ratio = us_distance / max(float(env.uav_usv_range), 1e-9)
@@ -443,7 +463,7 @@ def score_candidate_trajectory(
 
         if use_fim and hasattr(env, "compute_fim_metrics_for"):
             fim = env.compute_fim_metrics_for(center, target, comm_risk=comm_risk)
-            info_costs.append(float(fim["trace_inv"]))
+            info_costs.append(float(fim.get("fim_trace_inv", fim.get("trace_inv", np.nan))))
         else:
             info_costs.append(float(distance(center, target) / max(env.search_radius, 1e-9)))
 
@@ -458,15 +478,17 @@ def score_candidate_trajectory(
                 "sg_distance": sg_distance,
                 "target_distance": distance(center, target),
                 "connected_fraction": 0.5 * float(us_ratio <= 1.0) + 0.5 * float(sg_ratio <= 1.0),
+                "total_energy_used": predicted_total_energy,
+                "energy_budget": energy_budget,
+                "remaining_energy_mean": remaining_per_uuv,
+                "remaining_energy_min": remaining_per_uuv,
             }
         )
         next_value = lyapunov_value(next_state, next_metrics, config)
-        target_error = float(np.sum((target - center) ** 2))
-        safety_cfg = dict((config or {}).get("safety", {}))
-        bound = -float(safety_cfg.get("c", 0.001)) * target_error + float(safety_cfg.get("epsilon", 1.0))
-        margin = float(next_value - previous_value - bound)
-        if use_lyapunov and margin > 0.0:
-            lyapunov_penalty += margin
+        safe_transition = is_safe_transition(previous_state, next_state, previous_metrics, next_metrics, config)
+        margin = float(next_value - previous_value)
+        if use_lyapunov and not safe_transition:
+            lyapunov_penalty += max(1.0, margin)
             safety_violations += 1
         previous_state = next_state
         previous_metrics = next_metrics
@@ -666,3 +688,11 @@ def _coarse_direction(env: Any, coarse_action: int | None) -> np.ndarray:
         coarse_action = env.greedy_action_toward_target()
     direction_xy = np.asarray(env.ACTION_DIRECTIONS[int(coarse_action)], dtype=float)
     return np.array([direction_xy[0], direction_xy[1], 0.0], dtype=float)
+
+
+def _planning_target_position(env: Any) -> np.ndarray:
+    if hasattr(env, "_belief_target_position"):
+        return np.asarray(env._belief_target_position(), dtype=float)
+    if hasattr(env, "state") and getattr(env.state, "belief_target_position", None) is not None:
+        return np.asarray(env.state.belief_target_position, dtype=float)
+    return np.asarray(env.state.target_position, dtype=float)

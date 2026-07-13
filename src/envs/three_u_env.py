@@ -4,7 +4,7 @@ This environment follows a compact abstraction of the 3U hunting problem:
 
 - one UAV monitors the 400 m x 400 m area from altitude ``h``;
 - one USV performs a random surface relay walk at ``z = 0``;
-- three UUVs are represented by a single underwater group center ``G``;
+- three UUVs are represented by a single underwater formation center ``G``;
 - the target stays at the hunting depth and can either move away from ``G`` or
   use a one-step Stackelberg best response.
 
@@ -24,6 +24,7 @@ from sensing.fisher_information import (
     fisher_information_matrix,
     range_bearing_measurement,
 )
+from utils.energy import uuv_group_step_energy
 
 
 @dataclass
@@ -55,7 +56,7 @@ class ThreeUState:
 
     @property
     def uuv_positions(self) -> np.ndarray:
-        """Compatibility view: three UUVs colocated at the group center."""
+        """Compatibility view: UUVs represented by the formation center."""
 
         return np.repeat(self.uuv_center[None, :], 3, axis=0)
 
@@ -76,7 +77,7 @@ class ThreeUEnv:
         ``direction_GW`` are computed from the noisy target belief rather than
         the true target position.
 
-    Action ids use eight compass directions for the UUV group center:
+    Action ids use eight compass directions for the UUV formation center:
         0 east, 1 north-east, 2 north, 3 north-west,
         4 west, 5 south-west, 6 south, 7 south-east.
     """
@@ -84,6 +85,7 @@ class ThreeUEnv:
     primitive_action_count = 8
     action_space_n = 8
     group_center_mode = True
+    planning_model = "formation_center"
 
     ACTION_DIRECTIONS = np.asarray(
         [
@@ -134,6 +136,14 @@ class ThreeUEnv:
         self.energy_base = float(self.env_config.get("energy_base", 2.0))
         self.energy_linear = float(self.env_config.get("energy_linear", 0.8))
         self.energy_quadratic = float(self.env_config.get("energy_quadratic", 0.04))
+        self.energy_config = {
+            "model": "quadratic",
+            "energy_base": self.energy_base,
+            "energy_linear": self.energy_linear,
+            "energy_quadratic": self.energy_quadratic,
+            "motion_only": True,
+        }
+        self.energy_config.update(dict(self.config.get("energy", {})))
         self.energy_budget = float(self.env_config.get("uuv_energy_budget", 65_000.0))
         self.safety_config = dict(self.config.get("safety", {}))
         self.use_lyapunov = bool(self.safety_config.get("use_lyapunov", False))
@@ -462,11 +472,11 @@ class ThreeUEnv:
         }
 
     def predict_target_best_response(self, uuv_center: np.ndarray | None = None) -> np.ndarray:
-        """Predict the target's next escape displacement away from a UUV center."""
+        """Predict the belief target's next escape displacement away from a UUV center."""
 
         self._require_state()
         center = self.state.uuv_center if uuv_center is None else np.asarray(uuv_center, dtype=float)
-        direction = self._unit_vector(self.state.target_position - center)
+        direction = self._unit_vector(self._belief_target_position() - center)
         horizontal = direction[:2]
         if np.linalg.norm(horizontal) <= 1e-12:
             horizontal = self.state.direction_gw[:2]
@@ -606,9 +616,15 @@ class ThreeUEnv:
         self.state.target_escaped = bool(escaped_boundary or self._target_distance() >= self.escape_distance)
 
     def _compute_step_energy(self, actual_move: float) -> float:
-        speed = actual_move / max(self.dt, 1e-12)
-        per_uuv = self.energy_base * self.dt + self.energy_linear * actual_move + self.energy_quadratic * speed**2
-        return float(self.num_uuvs * per_uuv)
+        breakdown = uuv_group_step_energy(
+            displacement=float(actual_move),
+            dt=self.dt,
+            num_uuvs=self.num_uuvs,
+            communication_distance_m=self._sg_distance(),
+            connected=self._sg_distance() <= self.usv_uuv_range,
+            energy_config=self.energy_config,
+        )
+        return float(breakdown.total)
 
     def _append_logs(self, step_energy: float) -> None:
         us_distance = self._us_distance()
@@ -665,7 +681,9 @@ class ThreeUEnv:
             "constraints_satisfied": float(self.check_constraints()),
             "step_energy": float(self.history["energy"][-1]) if self.history["energy"] else 0.0,
             "total_energy_used": float(self.state.total_energy_used),
+            "energy_budget": float(self.state.energy_budget),
             "total_voyage_distance": float(self.state.total_voyage_distance),
+            "planning_model": self.planning_model,
             "us_distance": us_distance,
             "sg_distance": sg_distance,
             "mean_uuv_usv_distance": sg_distance,
@@ -733,8 +751,8 @@ class ThreeUEnv:
         self.current_belief_error = self._distance(true_target, belief)
 
         if self.use_fim:
-            sensor_positions, noise_covariances = self._fim_sensor_inputs(true_target)
-            self.current_fim = fisher_information_matrix(true_target, sensor_positions, noise_covariances)
+            sensor_positions, noise_covariances = self._fim_sensor_inputs(belief)
+            self.current_fim = fisher_information_matrix(belief, sensor_positions, noise_covariances)
             self.current_fim_metrics = fim_metrics(self.current_fim, regularization=self.fim_regularization)
             logdet = float(self.current_fim_metrics.get("logdet", 0.0))
             self.current_normalized_logdet = float(np.tanh(logdet / 10.0))
@@ -747,15 +765,10 @@ class ThreeUEnv:
         estimates = []
         variances = []
 
-        estimates.append(self._cartesian_position_observation(true_target, self.observation_noise_uav, z_scale=0.5))
-        variances.append(max(self.observation_noise_uav**2, 1e-9))
-
-        estimates.append(self._cartesian_position_observation(true_target, self.observation_noise_usv, z_scale=0.35))
-        variances.append(max(self.observation_noise_usv**2, 1e-9))
-
-        if self._target_distance() <= self.uuv_observation_range:
-            estimates.append(self._uuv_range_bearing_position_observation(true_target))
-            variances.append(max(self.observation_noise_uuv**2, 1e-9))
+        for sensor_position, noise_std in self._target_sensor_specs(true_target):
+            estimates.append(self._range_bearing_position_observation(true_target, sensor_position, noise_std))
+            covariance = self._range_bearing_covariance(true_target, sensor_position, noise_std)
+            variances.append(max(float(np.trace(covariance)), 1e-9))
 
         weights = 1.0 / np.asarray(variances, dtype=float)
         weights = weights / max(float(np.sum(weights)), 1e-12)
@@ -764,25 +777,27 @@ class ThreeUEnv:
             fused += float(weight) * estimate
         return self._clip_target_belief(fused)
 
-    def _cartesian_position_observation(self, true_target: np.ndarray, noise_std: float, z_scale: float) -> np.ndarray:
-        std = max(float(noise_std), 0.0)
-        noise = self.rng.normal(0.0, std, size=3)
-        noise[2] *= float(z_scale)
-        observation = true_target + noise
-        return self._clip_target_belief(observation)
-
-    def _uuv_range_bearing_position_observation(self, true_target: np.ndarray) -> np.ndarray:
-        measurement = range_bearing_measurement(true_target, self.state.uuv_center)
-        horizontal_distance = max(float(np.linalg.norm(true_target[:2] - self.state.uuv_center[:2])), 1.0)
-        range_noise = self.rng.normal(0.0, self.observation_noise_uuv)
-        bearing_noise = self.rng.normal(0.0, self.observation_noise_uuv / horizontal_distance)
+    def _range_bearing_position_observation(
+        self,
+        true_target: np.ndarray,
+        sensor_position: np.ndarray,
+        noise_std: float,
+    ) -> np.ndarray:
+        measurement = range_bearing_measurement(true_target, sensor_position)
+        covariance = self._range_bearing_covariance(true_target, sensor_position, noise_std)
+        range_noise = self.rng.normal(0.0, np.sqrt(max(float(covariance[0, 0]), 0.0)))
+        bearing_noise = self.rng.normal(0.0, np.sqrt(max(float(covariance[1, 1]), 0.0)))
         noisy_range = max(0.0, float(measurement[0] + range_noise))
         noisy_bearing = float(measurement[1] + bearing_noise)
 
-        estimate = self.state.uuv_center.copy()
-        estimate[0] += noisy_range * np.cos(noisy_bearing)
-        estimate[1] += noisy_range * np.sin(noisy_bearing)
-        estimate[2] = true_target[2] + self.rng.normal(0.0, self.observation_noise_uuv * 0.25)
+        sensor = np.asarray(sensor_position, dtype=float)
+        estimate = sensor.copy()
+        known_target_depth = self.hunting_depth
+        vertical_offset = known_target_depth - sensor[2]
+        horizontal_range = float(np.sqrt(max(noisy_range**2 - vertical_offset**2, 0.0)))
+        estimate[0] += horizontal_range * np.cos(noisy_bearing)
+        estimate[1] += horizontal_range * np.sin(noisy_bearing)
+        estimate[2] = known_target_depth
         return self._clip_target_belief(estimate)
 
     def _fim_sensor_inputs(self, true_target: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
@@ -793,18 +808,27 @@ class ThreeUEnv:
         true_target: np.ndarray,
         uuv_center: np.ndarray,
     ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-        sensor_positions = [self.state.uav_position.copy(), self.state.usv_position.copy()]
+        sensor_specs = self._target_sensor_specs(true_target, uuv_center=uuv_center)
+        sensor_positions = [sensor_position.copy() for sensor_position, _noise_std in sensor_specs]
         noise_covariances = [
-            self._range_bearing_covariance(true_target, self.state.uav_position, self.observation_noise_uav),
-            self._range_bearing_covariance(true_target, self.state.usv_position, self.observation_noise_usv),
+            self._range_bearing_covariance(true_target, sensor_position, noise_std)
+            for sensor_position, noise_std in sensor_specs
         ]
-        candidate_center = np.asarray(uuv_center, dtype=float)
-        if self._distance(candidate_center, true_target) <= self.uuv_observation_range:
-            sensor_positions.append(candidate_center.copy())
-            noise_covariances.append(
-                self._range_bearing_covariance(true_target, candidate_center, self.observation_noise_uuv)
-            )
         return sensor_positions, noise_covariances
+
+    def _target_sensor_specs(
+        self,
+        target: np.ndarray,
+        uuv_center: np.ndarray | None = None,
+    ) -> list[tuple[np.ndarray, float]]:
+        candidate_center = self.state.uuv_center if uuv_center is None else np.asarray(uuv_center, dtype=float)
+        specs = [
+            (self.state.uav_position.copy(), self.observation_noise_uav),
+            (self.state.usv_position.copy(), self.observation_noise_usv),
+        ]
+        if self._distance(candidate_center, target) <= self.uuv_observation_range:
+            specs.append((candidate_center.copy(), self.observation_noise_uuv))
+        return specs
 
     def _range_bearing_covariance(self, target: np.ndarray, sensor: np.ndarray, position_noise_std: float) -> np.ndarray:
         std = max(float(position_noise_std), 1e-9)
@@ -847,27 +871,21 @@ class ThreeUEnv:
 
     def _select_executed_action(self, action: int) -> Dict[str, float]:
         action = int(action)
-        game_selected_action = action
         game_info = self._default_game_info(action)
-
-        if self.use_stackelberg:
-            from game.stackelberg import stackelberg_select_action
-
-            game_selected_action, game_info = stackelberg_select_action(
-                self,
-                None,
-                action,
-                self.config,
-                return_info=True,
-            )
-            game_selected_action = int(game_selected_action)
+        game_info.update(
+            {
+                "stackelberg_proposed_action": float(action),
+                "stackelberg_selected_action": float(action),
+                "stackelberg_changed_action": 0.0,
+            }
+        )
 
         if not self.use_lyapunov:
             game_info.update(
                 {
                     "original_action": float(action),
-                    "executed_action": float(game_selected_action),
-                    "action_replaced": float(action != game_selected_action),
+                    "executed_action": float(action),
+                    "action_replaced": 0.0,
                     "proposed_was_safe": 1.0,
                     "safety_filter_active": 0.0,
                     "lyapunov_changed_action": 0.0,
@@ -877,14 +895,14 @@ class ThreeUEnv:
 
         from safety.lyapunov import select_safe_action
 
-        executed_action, safety_info = select_safe_action(self, game_selected_action, range(self.action_space_n), self.config)
+        executed_action, safety_info = select_safe_action(self, action, range(self.action_space_n), self.config)
         safety_info = dict(safety_info)
         safety_info.update(game_info)
         safety_info["original_action"] = float(action)
         safety_info["executed_action"] = float(executed_action)
         safety_info["safety_filter_active"] = 1.0
         safety_info["action_replaced"] = float(int(executed_action) != action)
-        safety_info["lyapunov_changed_action"] = float(int(executed_action) != game_selected_action)
+        safety_info["lyapunov_changed_action"] = float(int(executed_action) != action)
         return safety_info
 
     def _select_target_response(self, executed_action: int, selection_info: Dict[str, float]) -> Dict[str, float]:

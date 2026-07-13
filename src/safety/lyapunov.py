@@ -1,8 +1,9 @@
-"""Lyapunov-inspired action filtering for the simplified 3U environment.
+"""Lyapunov-inspired risk filtering for the simplified 3U environment.
 
 The functions in this module evaluate a scalar Lyapunov-style score for the
-current UAV-USV-UUV state and use one-step lookahead to reject candidate UUV
-actions that make the score increase too aggressively.
+current UAV-USV-UUV state and use one-step lookahead to reject only candidate
+UUV actions that create safety risk: leaving bounds, breaking the relay chain,
+or running too low on UUV energy.
 
 This is an educational safety filter. It is useful for comparing safer action
 selection heuristics, but it is not a formal proof of global stability for the
@@ -21,27 +22,22 @@ StateParts = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, f
 
 
 def lyapunov_value(state: Any, metrics: Dict[str, Any] | None, config: Dict[str, Any] | None) -> float:
-    """Return the scalar Lyapunov-inspired score for a simulator state.
+    """Return the scalar Lyapunov-inspired risk score.
 
-    The simplified reproduction represents the UUV team by its group center, so
-    ``formation_error`` defaults to zero. Connectivity, energy, and boundary
-    terms remain active and are designed to increase when links become weak,
-    UUV energies diverge, or the UUV/target approach the search-area boundary.
+    The score intentionally excludes target-distance or hunting-progress terms
+    so the filter cannot take over the tracking task from the trajectory
+    generator.
     """
 
-    uav, usv, uuv_center, target, _direction, _voyage = _state_parts(state)
+    uav, usv, uuv_center, _target, _direction, _voyage = _state_parts(state)
     safety, _env = _config_parts(config)
 
-    target_error = float(np.sum((target - uuv_center) ** 2))
-    formation_error = float(_metric(metrics, "formation_error", 0.0))
     connectivity_risk = _connectivity_risk(uav, usv, uuv_center, metrics, config)
-    energy_risk = _energy_imbalance_risk(state, metrics)
-    boundary_risk = _boundary_risk(uuv_center, target, config)
+    energy_risk = _energy_shortfall_risk(state, metrics, config)
+    boundary_risk = _boundary_risk(uuv_center, config)
 
     value = (
-        float(safety.get("alpha_target", 1.0)) * target_error
-        + float(safety.get("alpha_formation", 0.0)) * formation_error
-        + float(safety.get("alpha_conn", 0.5)) * connectivity_risk
+        float(safety.get("alpha_conn", 0.5)) * connectivity_risk
         + float(safety.get("alpha_energy", 0.2)) * energy_risk
         + float(safety.get("alpha_boundary", 0.2)) * boundary_risk
     )
@@ -69,12 +65,7 @@ def is_safe_transition(
     next_metrics: Dict[str, Any] | None,
     config: Dict[str, Any] | None,
 ) -> bool:
-    """Check the configured one-step Lyapunov decrease condition.
-
-    The condition is
-
-    ``V_{t+1} - V_t <= -c * ||p_target - p_uuv_center||^2 + epsilon``.
-    """
+    """Check whether a transition stays within the configured risk envelope."""
 
     return bool(_condition_margin(prev_state, next_state, prev_metrics, next_metrics, config) <= 0.0)
 
@@ -98,8 +89,8 @@ def filter_action(env: Any, candidate_action: int, config: Dict[str, Any] | None
     prev_value = lyapunov_value(prev_state, prev_metrics, config)
     next_value = lyapunov_value(next_state, next_metrics, config)
     delta = float(next_value - prev_value)
-    rhs = _decrease_bound(prev_state, config)
-    margin = float(delta - rhs)
+    risk_tolerance = _risk_tolerance(config)
+    margin = _condition_margin(prev_state, next_state, prev_metrics, next_metrics, config)
     is_safe = bool(margin <= 0.0)
 
     return {
@@ -110,7 +101,7 @@ def filter_action(env: Any, candidate_action: int, config: Dict[str, Any] | None
         "lyapunov_value": float(next_value),
         "lyapunov_prev_value": float(prev_value),
         "lyapunov_delta": float(delta),
-        "lyapunov_bound": float(rhs),
+        "lyapunov_bound": float(risk_tolerance),
         "lyapunov_margin": float(margin),
         "predicted_done": float(done),
         "predicted_target_distance": float(next_metrics.get("target_distance", np.nan)),
@@ -180,13 +171,14 @@ def lyapunov_components(
 ) -> Dict[str, float]:
     """Expose component values for diagnostics and tests."""
 
-    uav, usv, uuv_center, target, _direction, _voyage = _state_parts(state)
+    uav, usv, uuv_center, _target, _direction, _voyage = _state_parts(state)
     return {
-        "target_error": float(np.sum((target - uuv_center) ** 2)),
-        "formation_error": float(_metric(metrics, "formation_error", 0.0)),
+        "target_error": 0.0,
+        "formation_error": 0.0,
         "connectivity_risk": _connectivity_risk(uav, usv, uuv_center, metrics, config),
-        "energy_imbalance_risk": _energy_imbalance_risk(state, metrics),
-        "boundary_risk": _boundary_risk(uuv_center, target, config),
+        "energy_imbalance_risk": 0.0,
+        "energy_shortfall_risk": _energy_shortfall_risk(state, metrics, config),
+        "boundary_risk": _boundary_risk(uuv_center, config),
     }
 
 
@@ -286,12 +278,31 @@ def _energy_imbalance_risk(state: Any, metrics: Dict[str, Any] | None) -> float:
     return 0.0
 
 
-def _boundary_risk(uuv_center: np.ndarray, target: np.ndarray, config: Dict[str, Any] | None) -> float:
+def _energy_shortfall_risk(state: Any, metrics: Dict[str, Any] | None, config: Dict[str, Any] | None) -> float:
+    safety, env_config = _config_parts(config)
+    reserve_fraction = float(safety.get("energy_reserve_fraction", 0.05))
+    budget = float(_metric(metrics, "energy_budget", env_config.get("uuv_energy_budget", 65_000.0)))
+    budget = max(abs(budget), 1e-9)
+
+    remaining_min = _metric(metrics, "remaining_energy_min", None)
+    if remaining_min is None and hasattr(state, "uuv_energy"):
+        energy_array = np.asarray(state.uuv_energy, dtype=float).ravel()
+        if energy_array.size:
+            remaining_min = float(np.min(energy_array))
+    if remaining_min is None:
+        total_used = float(_metric(metrics, "total_energy_used", 0.0))
+        remaining_min = budget - total_used / 3.0
+
+    reserve = reserve_fraction * budget
+    return float(max(0.0, reserve - float(remaining_min)) / budget)
+
+
+def _boundary_risk(uuv_center: np.ndarray, config: Dict[str, Any] | None) -> float:
     safety, env_config = _config_parts(config)
     area_size = float(env_config.get("area_size", 400.0))
     margin = float(safety.get("boundary_margin", 0.1 * area_size))
     margin = max(margin, 1e-9)
-    return float(_point_boundary_risk(uuv_center, area_size, margin) + _point_boundary_risk(target, area_size, margin))
+    return float(_point_boundary_risk(uuv_center, area_size, margin))
 
 
 def _point_boundary_risk(position: np.ndarray, area_size: float, margin: float) -> float:
@@ -302,13 +313,34 @@ def _point_boundary_risk(position: np.ndarray, area_size: float, margin: float) 
     return float(((margin - min_edge_distance) / margin) ** 2)
 
 
-def _decrease_bound(prev_state: Any, config: Dict[str, Any] | None) -> float:
+def _risk_tolerance(config: Dict[str, Any] | None) -> float:
     safety, _env_config = _config_parts(config)
-    _uav, _usv, uuv_center, target, _direction, _voyage = _state_parts(prev_state)
-    target_error = float(np.sum((target - uuv_center) ** 2))
-    c_value = float(safety.get("c", 0.001))
-    epsilon = float(safety.get("epsilon", 1.0))
-    return float(-c_value * target_error + epsilon)
+    return float(safety.get("risk_tolerance", safety.get("epsilon", 1.0)))
+
+
+def _hard_safety_violation(
+    next_state: Any,
+    next_metrics: Dict[str, Any] | None,
+    config: Dict[str, Any] | None,
+) -> float:
+    uav, usv, uuv_center, _target, _direction, _voyage = _state_parts(next_state)
+    _safety, env_config = _config_parts(config)
+    area_size = float(env_config.get("area_size", 400.0))
+    uav_usv_range = float(env_config.get("uav_usv_range", 700.0))
+    usv_uuv_range = float(env_config.get("usv_uuv_range", env_config.get("uuv_acoustic_range", 700.0)))
+    connected_fraction = _metric(next_metrics, "connected_fraction", None)
+    if connected_fraction is None:
+        connected_fraction = 0.5 * float(_distance(uav, usv) <= uav_usv_range)
+        connected_fraction += 0.5 * float(_distance(usv, uuv_center) <= usv_uuv_range)
+
+    remaining_min = _metric(next_metrics, "remaining_energy_min", None)
+    energy_shortfall = _energy_shortfall_risk(next_state, next_metrics, config)
+    constraints_satisfied = float(_metric(next_metrics, "constraints_satisfied", 1.0))
+    in_bounds = 0.0 <= uuv_center[0] <= area_size and 0.0 <= uuv_center[1] <= area_size
+    disconnected = float(connected_fraction) < 1.0
+    energy_low = energy_shortfall > 0.0 or (remaining_min is not None and float(remaining_min) <= 0.0)
+    violated = (constraints_satisfied < 1.0) or (not in_bounds) or disconnected or energy_low
+    return float(violated)
 
 
 def _condition_margin(
@@ -319,7 +351,8 @@ def _condition_margin(
     config: Dict[str, Any] | None,
 ) -> float:
     delta = lyapunov_delta(prev_state, next_state, prev_metrics, next_metrics, config)
-    return float(delta - _decrease_bound(prev_state, config))
+    hard_violation = _hard_safety_violation(next_state, next_metrics, config)
+    return float(delta - _risk_tolerance(config) + 1_000.0 * hard_violation)
 
 
 def _action_to_int(action: Any) -> int:

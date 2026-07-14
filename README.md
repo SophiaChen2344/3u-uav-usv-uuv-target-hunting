@@ -62,10 +62,12 @@ reproduction-style simulation results, not as exact paper results.
   integrated planner's primary trajectory generator. It is conditioned on the
   target belief mean and covariance, so the model sees both where the target is
   likely to be and which uncertainty directions need information. Training adds
-  differentiable FIM information gain plus speed, step-length, and smoothness
-  penalties to the base Flow Matching loss. At inference time the planner uses
-  one generated primary trajectory directly, without online FIM candidate
-  filtering or trajectory optimization.
+  differentiable heterogeneous FIM information gain from UAV, USV, and UUV
+  range-bearing observations plus speed, step-length, and smoothness penalties
+  to the base Flow Matching loss. Smooth observation-range gates make the
+  information gain differentiable near sensor range limits. At inference time
+  the planner uses one generated primary trajectory directly, without online
+  FIM candidate filtering or trajectory optimization.
 - DQN / Double DQN / Dueling DQN: PyTorch agents learn UUV formation-center
   trajectory decisions.
 - ACO baseline: A grid-based Ant Colony Optimization planner provides a
@@ -309,8 +311,9 @@ results/datasets/
 - The Flow Matching generator is trained on synthetic trajectories from DQN
   rollouts, ACO-style paths, heuristic pursuit, and safety-filtered simulator
   rollouts because no official expert trajectory dataset is available. Its
-  training objective also rewards predicted trajectories that increase Fisher
-  information and penalizes dynamically awkward motion.
+  training objective also gives a stronger weight to predicted trajectories
+  that increase heterogeneous Fisher information and penalizes dynamically
+  awkward motion.
 - Flow Matching is the default integrated trajectory generator. DQN-family
   policies remain available as baselines or coarse-action conditioners.
 - Flow Matching checkpoints trained before target-belief covariance was added

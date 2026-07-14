@@ -77,7 +77,7 @@ flow_matching:
   gradient_clip: 5.0
   training_loss:
     w_flow: 1.0
-    w_information_gain: 0.05
+    w_information_gain: 0.2
     w_speed: 0.05
     w_step: 0.05
     w_smooth: 0.01
@@ -117,13 +117,16 @@ sensing:
   observation_noise_uav: 20.0
   observation_noise_usv: 10.0
   observation_noise_uuv: 5.0
+  uav_observation_range: 600.0
+  usv_observation_range: 400.0
+  uuv_observation_range: 130.0
+  observation_range_smoothing: 20.0
   bearing_reference_range: 100.0
   bearing_noise_scale: 1.0
   bearing_noise_floor: 1.0e-4
   fim_regularization: 1.0e-6
   info_reward_weight: 0.01
   belief_update_alpha: 0.35
-  uuv_observation_range: 130.0
 
 game:
   use_stackelberg: true

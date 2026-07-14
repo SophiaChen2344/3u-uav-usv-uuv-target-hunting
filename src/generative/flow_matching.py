@@ -273,7 +273,7 @@ def train_flow_matching(
     loss_cfg = dict(cfg.get("training_loss", cfg.get("loss_weights", {})))
     weights = {
         "flow": float(loss_cfg.get("w_flow", 1.0)),
-        "information": float(loss_cfg.get("w_information_gain", 0.05)),
+        "information": float(loss_cfg.get("w_information_gain", 0.2)),
         "speed": float(loss_cfg.get("w_speed", 0.05)),
         "step": float(loss_cfg.get("w_step", 0.05)),
         "smooth": float(loss_cfg.get("w_smooth", 0.01)),
@@ -640,7 +640,7 @@ def _differentiable_trajectory_information_gain(
     condition: torch.Tensor,
     config: Dict[str, Any] | None = None,
 ) -> torch.Tensor:
-    """Return differentiable log-det Fisher information gain for UUV waypoints."""
+    """Return heterogeneous differentiable log-det Fisher information gain."""
 
     target_mean = _condition_target_mean(condition)
     target_covariance = _condition_target_covariance(condition, config=config)
@@ -650,7 +650,47 @@ def _differentiable_trajectory_information_gain(
     prior_covariance = target_covariance + regularization * eye
     prior_precision = torch.linalg.pinv(prior_covariance)
 
-    delta = target_mean.unsqueeze(1) - trajectory
+    uav_fim = _differentiable_range_bearing_fim(
+        target_mean,
+        condition[:, UAV_SLICE].unsqueeze(1),
+        config=config,
+        sensor_key="uav",
+        regularization=regularization,
+    )
+    usv_fim = _differentiable_range_bearing_fim(
+        target_mean,
+        condition[:, USV_SLICE].unsqueeze(1),
+        config=config,
+        sensor_key="usv",
+        regularization=regularization,
+    )
+    uuv_fim = _differentiable_range_bearing_fim(
+        target_mean,
+        trajectory,
+        config=config,
+        sensor_key="uuv",
+        regularization=regularization,
+    )
+    trajectory_fim = uav_fim + usv_fim + uuv_fim
+
+    posterior_precision = prior_precision + trajectory_fim + regularization * eye
+    prior_precision = prior_precision + regularization * eye
+    _prior_sign, prior_logdet = torch.linalg.slogdet(prior_precision)
+    _posterior_sign, posterior_logdet = torch.linalg.slogdet(posterior_precision)
+    gain = posterior_logdet - prior_logdet
+    return torch.nan_to_num(gain, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _differentiable_range_bearing_fim(
+    target_mean: torch.Tensor,
+    sensor_positions: torch.Tensor,
+    config: Dict[str, Any] | None,
+    sensor_key: str,
+    regularization: float,
+) -> torch.Tensor:
+    """Return a differentiable range-bearing FIM contribution for one sensor type."""
+
+    delta = target_mean.unsqueeze(1) - sensor_positions
     dx = delta[..., 0]
     dy = delta[..., 1]
     dz = delta[..., 2]
@@ -661,17 +701,12 @@ def _differentiable_trajectory_information_gain(
     range_jacobian = delta / range_norm.unsqueeze(-1)
     bearing_jacobian = torch.stack([-dy / horizontal_sq, dx / horizontal_sq, torch.zeros_like(dx)], dim=-1)
 
-    range_var, bearing_var = _uuv_range_bearing_variances(config, regularization=regularization)
+    range_var, bearing_var = _range_bearing_variances(config, sensor_key=sensor_key, regularization=regularization)
     range_term = torch.einsum("bhi,bhj->bhij", range_jacobian, range_jacobian) / range_var
     bearing_term = torch.einsum("bhi,bhj->bhij", bearing_jacobian, bearing_jacobian) / bearing_var
-    trajectory_fim = torch.sum(range_term + bearing_term, dim=1)
-
-    posterior_precision = prior_precision + trajectory_fim + regularization * eye
-    prior_precision = prior_precision + regularization * eye
-    _prior_sign, prior_logdet = torch.linalg.slogdet(prior_precision)
-    _posterior_sign, posterior_logdet = torch.linalg.slogdet(posterior_precision)
-    gain = posterior_logdet - prior_logdet
-    return torch.nan_to_num(gain, nan=0.0, posinf=0.0, neginf=0.0)
+    gate = _smooth_observation_weight(range_norm, config=config, sensor_key=sensor_key, regularization=regularization)
+    fim = (range_term + bearing_term) * gate.unsqueeze(-1).unsqueeze(-1)
+    return torch.sum(fim, dim=1)
 
 
 def _motion_regularization_losses(
@@ -697,21 +732,46 @@ def _motion_regularization_losses(
     return speed_loss, step_loss, smooth_loss
 
 
-def _uuv_range_bearing_variances(
+def _range_bearing_variances(
     config: Dict[str, Any] | None = None,
+    sensor_key: str = "uuv",
     regularization: float = 1e-9,
 ) -> tuple[float, float]:
-    """Return UUV range and bearing variances matching the environment sensor model."""
+    """Return sensor-specific range and bearing variances matching the environment model."""
 
     sensing_cfg = dict((config or {}).get("sensing", {}))
     env_cfg = _env_config(config or {})
-    range_std = max(float(sensing_cfg.get("observation_noise_uuv", 5.0)), regularization)
+    default_noise = {"uav": 20.0, "usv": 10.0, "uuv": 5.0}.get(str(sensor_key).lower(), 5.0)
+    range_std = max(float(sensing_cfg.get(f"observation_noise_{sensor_key}", default_noise)), regularization)
     default_reference = 0.25 * float(env_cfg.get("area_size", 400.0))
     reference_range = max(float(sensing_cfg.get("bearing_reference_range", default_reference)), 1.0)
     bearing_scale = max(float(sensing_cfg.get("bearing_noise_scale", 1.0)), 0.0)
     bearing_floor = max(float(sensing_cfg.get("bearing_noise_floor", 1e-4)), regularization)
     bearing_std = max(bearing_floor, bearing_scale * range_std / reference_range)
     return max(range_std**2, regularization), max(bearing_std**2, regularization)
+
+
+def _smooth_observation_weight(
+    range_norm: torch.Tensor,
+    config: Dict[str, Any] | None,
+    sensor_key: str,
+    regularization: float,
+) -> torch.Tensor:
+    """Return a sigmoid observation-range gate instead of a hard cutoff."""
+
+    sensing_cfg = dict((config or {}).get("sensing", {}))
+    env_cfg = _env_config(config or {})
+    default_area = float(env_cfg.get("area_size", 400.0))
+    default_ranges = {
+        "uav": max(1.5 * default_area, 1.0),
+        "usv": max(default_area, 1.0),
+        "uuv": float(sensing_cfg.get("uuv_observation_range", env_cfg.get("sonar_radius", 130.0))),
+    }
+    observation_range = float(sensing_cfg.get(f"{sensor_key}_observation_range", default_ranges.get(sensor_key, 0.0)))
+    if observation_range <= 0.0:
+        return torch.ones_like(range_norm)
+    smoothing = max(float(sensing_cfg.get("observation_range_smoothing", 20.0)), regularization)
+    return torch.sigmoid((observation_range - range_norm) / smoothing)
 
 
 def _condition_target_mean(condition: torch.Tensor) -> torch.Tensor:

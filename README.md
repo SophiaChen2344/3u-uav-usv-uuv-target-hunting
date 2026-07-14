@@ -63,7 +63,9 @@ reproduction-style simulation results, not as exact paper results.
   target belief mean and covariance, so the model sees both where the target is
   likely to be and which uncertainty directions need information. Training adds
   differentiable FIM information gain plus speed, step-length, and smoothness
-  penalties to the base Flow Matching loss.
+  penalties to the base Flow Matching loss. At inference time the planner uses
+  one generated primary trajectory directly, without online FIM candidate
+  filtering or trajectory optimization.
 - DQN / Double DQN / Dueling DQN: PyTorch agents learn UUV formation-center
   trajectory decisions.
 - ACO baseline: A grid-based Ant Colony Optimization planner provides a
@@ -310,7 +312,9 @@ results/datasets/
   training objective also rewards predicted trajectories that increase Fisher
   information and penalizes dynamically awkward motion.
 - Flow Matching is the default integrated trajectory generator. DQN-family
-  agents remain available as baselines or coarse-action conditioners.
+  policies remain available as baselines or coarse-action conditioners.
+- Flow Matching checkpoints trained before target-belief covariance was added
+  use an older condition dimension and should be regenerated.
 - Exact numerical results may differ from the paper.
 - The ACO baseline is a standard grid-based approximation rather than an
   official baseline implementation.

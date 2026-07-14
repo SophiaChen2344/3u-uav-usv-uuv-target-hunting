@@ -14,6 +14,10 @@ responsibilities.
   trajectory is used to compute differentiable Fisher-information gain, which
   is optimized together with the base Flow Matching velocity loss plus speed,
   step-length, and smoothness penalties.
+- Flow Matching inference now follows the learned generator directly. It
+  samples one primary trajectory and converts that trajectory to the UUV
+  formation-center action without using runtime FIM candidate filtering or
+  online trajectory optimization.
 - Stackelberg no longer reselects or overwrites the UUV control action. It now
   predicts only the target follower's best-response escape action for the
   action supplied by the trajectory generator or policy.
@@ -57,6 +61,9 @@ responsibilities.
 - Training should prefer trajectories that reduce target localization
   uncertainty along poorly estimated directions, while still discouraging
   excessive speed, step length, and nonsmooth motion.
+- Inference runtime should be more clearly attributable to the learned
+  generator because FIM affects behavior through conditioning and training
+  rather than through a separate candidate-ranking stage.
 - Connectivity metrics and safety violations should be more meaningful because
   link loss can occur under the default ranges.
 - Energy comparisons between real environment steps and Flow Matching
@@ -67,6 +74,9 @@ responsibilities.
 
 - Static diff validation with `git diff --check` passed; Git only reported
   expected CRLF line-ending warnings on Windows.
-- Python tests were not run in this environment because the available
-  `python.exe` is the WindowsApps placeholder and is not an executable Python
-  runtime.
+- Python 3.12.10 was installed through `winget`, dependencies from
+  `requirements.txt` were installed, and `python -m pytest` passed with
+  16 tests.
+- A short Flow Matching training smoke test also passed with a 12-sample
+  heuristic dataset, one training epoch, one generated trajectory, and direct
+  planner inference.

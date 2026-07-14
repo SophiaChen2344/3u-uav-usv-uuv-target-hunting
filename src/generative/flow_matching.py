@@ -312,7 +312,7 @@ def train_flow_matching(
             target_velocity = target_batch - x0
 
             prediction = model(x_t, t, condition_batch)
-            predicted_flat = x0 + prediction
+            predicted_flat = x_t + (1.0 - t) * prediction
             predicted_trajectory = predicted_flat.reshape(batch_size, trajectories.shape[1], 3)
 
             flow_loss = loss_fn(prediction, target_velocity)
@@ -530,7 +530,7 @@ def score_candidate_trajectory(
             fim = env.compute_fim_metrics_for(center, target, comm_risk=comm_risk)
             info_costs.append(float(fim.get("fim_trace_inv", fim.get("trace_inv", np.nan))))
         else:
-            info_costs.append(float(distance(center, target) / max(env.search_radius, 1e-9)))
+            info_costs.append(0.0)
 
         next_state = previous_state.copy()
         next_state[6:9] = center
@@ -738,12 +738,14 @@ def _condition_target_covariance(condition: torch.Tensor, config: Dict[str, Any]
     covariance[:, 2, 0] = entries[:, 4]
     covariance[:, 1, 2] = entries[:, 5]
     covariance[:, 2, 1] = entries[:, 5]
-    covariance = 0.5 * (covariance + covariance.transpose(1, 2))
-    return covariance + 1e-6 * eye
+    covariance = 0.5 * (covariance + covariance.transpose(1, 2)) + 1e-6 * eye
+    eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+    eigenvalues = torch.clamp(eigenvalues, min=1e-6)
+    return eigenvectors @ torch.diag_embed(eigenvalues) @ eigenvectors.transpose(1, 2)
 
 
 class FlowMatchingPlanner:
-    """Trajectory proposal planner that can wrap a DQN coarse policy."""
+    """Primary Flow Matching planner with optional heuristic fallback."""
 
     def __init__(
         self,
@@ -763,38 +765,50 @@ class FlowMatchingPlanner:
         self.last_diagnostics: pd.DataFrame | None = None
 
     def select_action(self, env: Any, coarse_action: int | None = None, agent: Any | None = None) -> int:
-        """Generate, score, and convert the selected trajectory to one action."""
+        """Generate one primary trajectory and convert it to one action.
+
+        Runtime inference intentionally avoids FIM-based candidate selection.
+        FIM and target belief covariance shape the generated trajectory through
+        the condition vector and training objective instead.
+        """
 
         if coarse_action is None:
             coarse_action = _coarse_action_from_agent(env, agent)
         condition = env.get_flow_condition_vector(coarse_action=coarse_action)
 
-        candidates = []
         if self.model is not None:
-            candidates.append(
-                sample_trajectories(
-                    self.model,
-                    condition,
-                    num_samples=self.num_candidates,
-                    horizon=self.horizon,
-                    env=env,
-                    config=self.config,
+            if int(condition.shape[0]) != int(self.model.condition_dim):
+                raise ValueError(
+                    "Flow Matching condition dimension mismatch: "
+                    f"model expects {self.model.condition_dim}, environment produced {condition.shape[0]}. "
+                    "Retrain the Flow Matching checkpoint after adding target-belief covariance conditioning."
                 )
+            trajectories = sample_trajectories(
+                self.model,
+                condition,
+                num_samples=1,
+                horizon=self.horizon,
+                env=env,
+                config=self.config,
             )
-        heuristic_count = max(4, min(self.num_candidates, 8))
-        candidates.append(heuristic_candidate_trajectories(env, heuristic_count, self.horizon, coarse_action))
-        trajectories = np.concatenate(candidates, axis=0)
+            source = "flow_matching"
+        else:
+            trajectories = heuristic_candidate_trajectories(env, 1, self.horizon, coarse_action)
+            source = "heuristic_fallback"
         trajectories = env.project_trajectory(trajectories)
+        selected = env.project_trajectory(trajectories[0])
 
-        use_full_terms = self.mode in {"full", "flow_matching_full", "dqn_fim_stackelberg_lyapunov"}
-        selected, score, diagnostics = select_best_trajectory(
+        score = score_candidate_trajectory(
             env,
-            trajectories,
+            selected,
             config=self.config,
-            use_fim=use_full_terms or self.mode == "flow_matching",
-            use_stackelberg=use_full_terms,
-            use_lyapunov=use_full_terms or "lyapunov" in self.mode,
+            use_fim=False,
+            use_stackelberg=False,
+            use_lyapunov=False,
         )
+        row = asdict(score)
+        row.update({"candidate": 0, "selected": True, "selection_source": source})
+        diagnostics = pd.DataFrame.from_records([row])
         self.last_trajectories = trajectories
         self.last_selected = selected
         self.last_score = score

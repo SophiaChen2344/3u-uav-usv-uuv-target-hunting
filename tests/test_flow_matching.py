@@ -72,6 +72,10 @@ def test_full_flow_matching_planner_runs_five_steps() -> None:
 
     for _ in range(5):
         action = planner.select_action(env)
+        assert planner.last_trajectories is not None
+        assert planner.last_trajectories.shape[0] == 1
+        assert planner.last_score is not None
+        assert planner.last_score.information_cost == 0.0
         state, reward, done, info = env.step(action)
         assert state.shape == (16,)
         assert isinstance(reward, float)

@@ -66,10 +66,13 @@ reproduction-style simulation results, not as exact paper results.
   positions and the predicted UUV formation-center waypoints, all using the
   shared range-bearing observation model. Smooth sigmoid observation-range
   gates make sensor influence differentiable near range limits. The default
-  information-gain weight is raised to `0.2`, and the objective also includes
-  speed, step-length, and smoothness penalties. At inference time the planner
-  uses one generated primary trajectory directly, without online FIM candidate
-  filtering or trajectory optimization.
+  information-gain weight is raised to `0.2`. The differentiable FIM is rolled
+  against the Stackelberg-predicted target escape path, and the objective also
+  includes speed, step-length, smoothness, boundary, relay-connectivity, and
+  energy-reserve penalties. These safety penalties do not include target
+  distance, so Lyapunov risk terms cannot take over the pursuit objective. At
+  inference time the planner uses one generated primary trajectory directly,
+  without online FIM candidate filtering or trajectory optimization.
 - DQN / Double DQN / Dueling DQN: PyTorch agents learn UUV formation-center
   trajectory decisions.
 - ACO baseline: A grid-based Ant Colony Optimization planner provides a
@@ -315,7 +318,8 @@ results/datasets/
   rollouts because no official expert trajectory dataset is available. Its
   training objective also gives a stronger weight to predicted trajectories
   that increase heterogeneous Fisher information from UAV, USV, and predicted
-  UUV sensing geometry, while penalizing dynamically awkward motion.
+  UUV sensing geometry along the Stackelberg-predicted target escape path,
+  while penalizing dynamically awkward and safety-risky motion.
 - Flow Matching is the default integrated trajectory generator. DQN-family
   policies remain available as baselines or coarse-action conditioners.
 - Flow Matching checkpoints trained before target-belief covariance was added

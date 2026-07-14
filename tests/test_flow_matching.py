@@ -56,6 +56,9 @@ def test_flow_matching_training_and_sampling_shape() -> None:
     assert np.isfinite(history["speed_loss"].iloc[-1])
     assert np.isfinite(history["step_loss"].iloc[-1])
     assert np.isfinite(history["smoothness_loss"].iloc[-1])
+    assert np.isfinite(history["boundary_loss"].iloc[-1])
+    assert np.isfinite(history["connectivity_loss"].iloc[-1])
+    assert np.isfinite(history["energy_safety_loss"].iloc[-1])
 
     env.reset()
     condition = env.get_flow_condition_vector(coarse_action=env.greedy_action_toward_target())
@@ -88,6 +91,40 @@ def test_differentiable_fim_uses_heterogeneous_sensors_with_smooth_range() -> No
     assert gain.shape == (1,)
     assert torch.isfinite(gain).all()
     assert float(gain.item()) > 0.0
+
+
+def test_differentiable_fim_uses_predicted_target_response_path() -> None:
+    config = load_flow_test_config()
+    config["sensing"]["uav_observation_range"] = 1000.0
+    config["sensing"]["usv_observation_range"] = 1000.0
+    config["sensing"]["uuv_observation_range"] = 1000.0
+    trajectory = np.repeat(np.array([[180.0, 190.0, -120.0]], dtype=np.float32), repeats=4, axis=0)
+
+    condition = np.zeros((39,), dtype=np.float32)
+    condition[0:3] = np.array([50.0, 50.0, 120.0], dtype=np.float32)
+    condition[3:6] = np.array([70.0, 330.0, 0.0], dtype=np.float32)
+    condition[6:9] = trajectory[0]
+    condition[9:12] = np.array([210.0, 210.0, -120.0], dtype=np.float32)
+    condition[12:18] = np.array([100.0, 80.0, 25.0, 10.0, 0.0, 0.0], dtype=np.float32)
+
+    static_condition = condition.copy()
+    escaping_condition = condition.copy()
+    escaping_condition[33:36] = np.array([15.0, -10.0, 0.0], dtype=np.float32)
+
+    static_gain = _differentiable_trajectory_information_gain(
+        torch.as_tensor(trajectory[None, :, :], dtype=torch.float32),
+        torch.as_tensor(static_condition[None, :], dtype=torch.float32),
+        config=config,
+    )
+    escaping_gain = _differentiable_trajectory_information_gain(
+        torch.as_tensor(trajectory[None, :, :], dtype=torch.float32),
+        torch.as_tensor(escaping_condition[None, :], dtype=torch.float32),
+        config=config,
+    )
+
+    assert torch.isfinite(static_gain).all()
+    assert torch.isfinite(escaping_gain).all()
+    assert not torch.allclose(static_gain, escaping_gain)
 
 
 def test_full_flow_matching_planner_runs_five_steps() -> None:

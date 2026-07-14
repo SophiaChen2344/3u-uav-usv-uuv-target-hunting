@@ -75,12 +75,16 @@ flow_matching:
   noise_scale: 18.0
   integration_steps: 20
   gradient_clip: 5.0
+  target_response_scale: 1.0
   training_loss:
     w_flow: 1.0
     w_information_gain: 0.2
     w_speed: 0.05
     w_step: 0.05
     w_smooth: 0.01
+    w_boundary: 0.05
+    w_connectivity: 0.05
+    w_energy_safety: 0.02
   scoring:
     w_hunt: 1.0
     w_energy: 0.001

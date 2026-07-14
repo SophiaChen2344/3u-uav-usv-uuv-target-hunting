@@ -3,9 +3,11 @@
 The model in this file is intentionally lightweight. It learns a vector field
 that transports noisy short-horizon UUV-center trajectories toward synthetic
 expert trajectories conditioned on the current 3U state, target belief mean,
-target belief covariance, and diagnostics. During training it also rewards
-differentiable Fisher-information gain along predicted future trajectories.
-At runtime it still samples trajectories with a single vector-field rollout.
+target belief covariance, predicted target response, and diagnostics. During
+training it also rewards differentiable Fisher-information gain along
+game-guided predicted future trajectories and applies small Lyapunov-style
+boundary, connectivity, and energy regularizers. At runtime it still samples
+trajectories with a single vector-field rollout.
 """
 
 from __future__ import annotations
@@ -31,6 +33,9 @@ USV_SLICE = slice(3, 6)
 UUV_CENTER_SLICE = slice(6, 9)
 TARGET_MEAN_SLICE = slice(9, 12)
 TARGET_COVARIANCE_SLICE = slice(12, 18)
+TARGET_RESPONSE_SLICE = slice(18, 21)
+ENERGY_SLICE = slice(22, 25)
+PREDICTED_RESPONSE_SLICE = slice(33, 36)
 CONDITION_DIM_WITH_COVARIANCE = 39
 
 
@@ -277,6 +282,9 @@ def train_flow_matching(
         "speed": float(loss_cfg.get("w_speed", 0.05)),
         "step": float(loss_cfg.get("w_step", 0.05)),
         "smooth": float(loss_cfg.get("w_smooth", 0.01)),
+        "boundary": float(loss_cfg.get("w_boundary", 0.05)),
+        "connectivity": float(loss_cfg.get("w_connectivity", 0.05)),
+        "energy_safety": float(loss_cfg.get("w_energy_safety", 0.02)),
     }
 
     for epoch in range(epochs):
@@ -286,6 +294,9 @@ def train_flow_matching(
         epoch_speed_losses = []
         epoch_step_losses = []
         epoch_smooth_losses = []
+        epoch_boundary_losses = []
+        epoch_connectivity_losses = []
+        epoch_energy_safety_losses = []
         for condition_batch, target_batch in loader:
             condition_batch = condition_batch.to(device)
             target_batch = target_batch.to(device)
@@ -329,12 +340,21 @@ def train_flow_matching(
                 max_speed=max_speed,
                 max_step=max_step,
             )
+            boundary_loss, connectivity_loss, energy_safety_loss = _lyapunov_safety_regularization_losses(
+                predicted_trajectory,
+                condition_batch[:, UUV_CENTER_SLICE],
+                condition_batch,
+                config=config,
+            )
             loss = (
                 weights["flow"] * flow_loss
                 + weights["information"] * information_loss
                 + weights["speed"] * speed_loss
                 + weights["step"] * step_loss
                 + weights["smooth"] * smooth_loss
+                + weights["boundary"] * boundary_loss
+                + weights["connectivity"] * connectivity_loss
+                + weights["energy_safety"] * energy_safety_loss
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -346,6 +366,9 @@ def train_flow_matching(
             epoch_speed_losses.append(float(speed_loss.detach().cpu().item()))
             epoch_step_losses.append(float(step_loss.detach().cpu().item()))
             epoch_smooth_losses.append(float(smooth_loss.detach().cpu().item()))
+            epoch_boundary_losses.append(float(boundary_loss.detach().cpu().item()))
+            epoch_connectivity_losses.append(float(connectivity_loss.detach().cpu().item()))
+            epoch_energy_safety_losses.append(float(energy_safety_loss.detach().cpu().item()))
 
         records.append(
             {
@@ -356,6 +379,13 @@ def train_flow_matching(
                 "speed_loss": float(np.mean(epoch_speed_losses)) if epoch_speed_losses else np.nan,
                 "step_loss": float(np.mean(epoch_step_losses)) if epoch_step_losses else np.nan,
                 "smoothness_loss": float(np.mean(epoch_smooth_losses)) if epoch_smooth_losses else np.nan,
+                "boundary_loss": float(np.mean(epoch_boundary_losses)) if epoch_boundary_losses else np.nan,
+                "connectivity_loss": float(np.mean(epoch_connectivity_losses))
+                if epoch_connectivity_losses
+                else np.nan,
+                "energy_safety_loss": float(np.mean(epoch_energy_safety_losses))
+                if epoch_energy_safety_losses
+                else np.nan,
             }
         )
 
@@ -640,9 +670,15 @@ def _differentiable_trajectory_information_gain(
     condition: torch.Tensor,
     config: Dict[str, Any] | None = None,
 ) -> torch.Tensor:
-    """Return heterogeneous differentiable log-det Fisher information gain."""
+    """Return heterogeneous differentiable log-det Fisher information gain.
 
-    target_mean = _condition_target_mean(condition)
+    The target belief mean is rolled forward with the condition vector's
+    Stackelberg predicted escape response. This keeps the FIM term aligned with
+    the intelligent target model without allowing Stackelberg to overwrite the
+    generated UUV action.
+    """
+
+    target_path = _condition_target_path(condition, horizon=trajectory.shape[1], config=config)
     target_covariance = _condition_target_covariance(condition, config=config)
     regularization = float((config or {}).get("sensing", {}).get("fim_regularization", 1e-6))
     regularization = max(regularization, 1e-9)
@@ -651,21 +687,21 @@ def _differentiable_trajectory_information_gain(
     prior_precision = torch.linalg.pinv(prior_covariance)
 
     uav_fim = _differentiable_range_bearing_fim(
-        target_mean,
+        target_path,
         condition[:, UAV_SLICE].unsqueeze(1),
         config=config,
         sensor_key="uav",
         regularization=regularization,
     )
     usv_fim = _differentiable_range_bearing_fim(
-        target_mean,
+        target_path,
         condition[:, USV_SLICE].unsqueeze(1),
         config=config,
         sensor_key="usv",
         regularization=regularization,
     )
     uuv_fim = _differentiable_range_bearing_fim(
-        target_mean,
+        target_path,
         trajectory,
         config=config,
         sensor_key="uuv",
@@ -682,7 +718,7 @@ def _differentiable_trajectory_information_gain(
 
 
 def _differentiable_range_bearing_fim(
-    target_mean: torch.Tensor,
+    target_positions: torch.Tensor,
     sensor_positions: torch.Tensor,
     config: Dict[str, Any] | None,
     sensor_key: str,
@@ -690,7 +726,21 @@ def _differentiable_range_bearing_fim(
 ) -> torch.Tensor:
     """Return a differentiable range-bearing FIM contribution for one sensor type."""
 
-    delta = target_mean.unsqueeze(1) - sensor_positions
+    if target_positions.ndim == 2:
+        target_positions = target_positions.unsqueeze(1)
+    if sensor_positions.ndim == 2:
+        sensor_positions = sensor_positions.unsqueeze(1)
+    if target_positions.shape[1] != sensor_positions.shape[1]:
+        if target_positions.shape[1] == 1:
+            target_positions = target_positions.repeat(1, sensor_positions.shape[1], 1)
+        elif sensor_positions.shape[1] == 1:
+            sensor_positions = sensor_positions.repeat(1, target_positions.shape[1], 1)
+        else:
+            raise ValueError(
+                "target_positions and sensor_positions must share or broadcast the horizon dimension."
+            )
+
+    delta = target_positions - sensor_positions
     dx = delta[..., 0]
     dy = delta[..., 1]
     dz = delta[..., 2]
@@ -730,6 +780,74 @@ def _motion_regularization_losses(
         accelerations = full_path[:, 2:, :] - 2.0 * full_path[:, 1:-1, :] + full_path[:, :-2, :]
         smooth_loss = torch.mean(torch.sum(accelerations**2, dim=-1)) / max(float(max_step) ** 2, 1e-12)
     return speed_loss, step_loss, smooth_loss
+
+
+def _lyapunov_safety_regularization_losses(
+    trajectory: torch.Tensor,
+    start_position: torch.Tensor,
+    condition: torch.Tensor,
+    config: Dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return differentiable safety-risk losses without target-distance terms."""
+
+    env_cfg = _env_config(config)
+    safety_cfg = dict((config or {}).get("safety", {}))
+    energy_cfg = dict((config or {}).get("energy", {}))
+    dtype = trajectory.dtype
+    device = trajectory.device
+    zero = torch.zeros((), dtype=dtype, device=device)
+
+    area_size = max(float(env_cfg.get("area_size", 400.0)), 1e-6)
+    margin = max(float(safety_cfg.get("boundary_margin", 40.0)), 1e-6)
+    xy = trajectory[..., :2]
+    lower_violation = torch.relu(float(margin) - xy)
+    upper_violation = torch.relu(xy - float(area_size - margin))
+    boundary_loss = torch.mean(lower_violation.pow(2) + upper_violation.pow(2)) / max(margin**2, 1e-12)
+
+    if condition.shape[1] >= USV_SLICE.stop:
+        uav = condition[:, UAV_SLICE].to(device=device, dtype=dtype)
+        usv = condition[:, USV_SLICE].to(device=device, dtype=dtype)
+        uav_usv_range = max(float(env_cfg.get("uav_usv_range", 180.0)), 1e-6)
+        usv_uuv_range = max(
+            float(env_cfg.get("usv_uuv_range", env_cfg.get("uuv_acoustic_range", 160.0))),
+            1e-6,
+        )
+        uav_usv_ratio = torch.linalg.norm(uav - usv, dim=-1) / uav_usv_range
+        usv_uuv_ratio = torch.linalg.norm(trajectory - usv.unsqueeze(1), dim=-1) / usv_uuv_range
+        connectivity_loss = 0.5 * (
+            torch.mean(torch.relu(uav_usv_ratio - 1.0).pow(2))
+            + torch.mean(torch.relu(usv_uuv_ratio - 1.0).pow(2))
+        )
+    else:
+        connectivity_loss = zero
+
+    full_path = torch.cat([start_position.unsqueeze(1), trajectory], dim=1)
+    displacements = full_path[:, 1:, :] - full_path[:, :-1, :]
+    step_lengths = torch.linalg.norm(displacements, dim=-1)
+    dt = max(float(env_cfg.get("dt", 1.0)), 1e-12)
+    speed = step_lengths / dt
+    num_uuvs = max(int(env_cfg.get("num_uuvs", 1)), 1)
+    budget = max(float(env_cfg.get("uuv_energy_budget", 65_000.0)), 1e-6)
+    base = float(energy_cfg.get("energy_base", energy_cfg.get("base", 2.0))) * dt
+    linear = float(energy_cfg.get("energy_linear", energy_cfg.get("linear", 0.8))) * step_lengths
+    quadratic = float(energy_cfg.get("energy_quadratic", energy_cfg.get("quadratic", 0.04))) * speed.pow(2)
+    group_step_energy = float(num_uuvs) * (base + linear + quadratic)
+
+    if condition.shape[1] >= ENERGY_SLICE.stop:
+        remaining_fraction = torch.clamp(
+            condition[:, ENERGY_SLICE.start + 1].to(device=device, dtype=dtype),
+            0.0,
+            1.0,
+        )
+        used_per_uuv_fraction = 1.0 - remaining_fraction
+    else:
+        used_per_uuv_fraction = torch.zeros((trajectory.shape[0],), dtype=dtype, device=device)
+    cumulative_per_uuv_fraction = torch.cumsum(group_step_energy / float(num_uuvs) / budget, dim=1)
+    predicted_used_fraction = used_per_uuv_fraction.unsqueeze(1) + cumulative_per_uuv_fraction
+    reserve_limit = max(0.0, 1.0 - float(safety_cfg.get("energy_reserve_fraction", 0.05)))
+    energy_safety_loss = torch.mean(torch.relu(predicted_used_fraction - reserve_limit).pow(2))
+
+    return boundary_loss, connectivity_loss, energy_safety_loss
 
 
 def _range_bearing_variances(
@@ -778,6 +896,26 @@ def _condition_target_mean(condition: torch.Tensor) -> torch.Tensor:
     if condition.shape[1] >= TARGET_MEAN_SLICE.stop:
         return condition[:, TARGET_MEAN_SLICE]
     return torch.zeros((condition.shape[0], 3), dtype=condition.dtype, device=condition.device)
+
+
+def _condition_target_response(condition: torch.Tensor) -> torch.Tensor:
+    if condition.shape[1] >= PREDICTED_RESPONSE_SLICE.stop:
+        return condition[:, PREDICTED_RESPONSE_SLICE]
+    if condition.shape[1] >= TARGET_RESPONSE_SLICE.stop:
+        return condition[:, TARGET_RESPONSE_SLICE]
+    return torch.zeros((condition.shape[0], 3), dtype=condition.dtype, device=condition.device)
+
+
+def _condition_target_path(
+    condition: torch.Tensor,
+    horizon: int,
+    config: Dict[str, Any] | None = None,
+) -> torch.Tensor:
+    target_mean = _condition_target_mean(condition)
+    target_response = _condition_target_response(condition)
+    scale = float(_flow_config(config).get("target_response_scale", 1.0))
+    steps = torch.arange(1, int(horizon) + 1, dtype=condition.dtype, device=condition.device).view(1, -1, 1)
+    return target_mean.unsqueeze(1) + steps * target_response.unsqueeze(1) * scale
 
 
 def _condition_target_covariance(condition: torch.Tensor, config: Dict[str, Any] | None = None) -> torch.Tensor:

@@ -10,11 +10,13 @@ responsibilities.
   The default planner mode is `full`, and Flow Matching conditions trajectory
   generation on the target belief mean, target belief covariance, FIM
   diagnostics, energy, connectivity, and predicted target response terms.
-- Flow Matching training is now information-aware. The model's predicted UUV
-  formation-center trajectory is combined with the current UAV and USV
-  positions from the condition vector to compute differentiable heterogeneous
-  Fisher-information gain, which is optimized together with the base Flow
-  Matching velocity loss plus speed, step-length, and smoothness penalties.
+- Flow Matching training is now information-aware and game-guided. The
+  condition vector's Stackelberg target escape response is rolled forward into
+  a predicted target path, and the model's predicted UUV formation-center
+  trajectory is combined with the current UAV and USV positions to compute
+  differentiable heterogeneous Fisher-information gain. This term is optimized
+  together with the base Flow Matching velocity loss plus speed, step-length,
+  smoothness, boundary, relay-connectivity, and energy-reserve penalties.
 - The differentiable FIM now uses smooth sigmoid observation-range gates, so
   sensor influence fades near UAV, USV, and UUV range limits instead of
   switching on or off discontinuously. The default ranges are 600 m for UAV,
@@ -23,6 +25,10 @@ responsibilities.
 - The Flow Matching information-gain loss weight was increased so the FIM term
   is less likely to be drowned out by the base velocity-matching loss. The
   default `w_information_gain` is now `0.2`.
+- Flow Matching training now includes Lyapunov-style safety regularizers for
+  boundary margin, UAV-USV/USV-UUV relay continuity, and UUV energy reserve.
+  These regularizers intentionally avoid target-distance terms, so they only
+  shape feasible generated motion rather than becoming a tracking controller.
 - Flow Matching inference now follows the learned generator directly. It
   samples one primary trajectory and converts that trajectory to the UUV
   formation-center action without using runtime FIM candidate filtering or
@@ -68,10 +74,11 @@ responsibilities.
 - FIM values, belief errors, and target observations should be more consistent
   because they are derived from a common sensor model.
 - Training should prefer trajectories that reduce target localization
-  uncertainty along poorly estimated directions, while still discouraging
-  excessive speed, step length, and nonsmooth motion. The stronger FIM loss
-  weight should make this information-seeking behavior more visible during
-  training.
+  uncertainty along poorly estimated directions and the Stackelberg-predicted
+  escape path, while still discouraging excessive speed, step length,
+  nonsmooth motion, boundary risk, relay-chain breakage, and low reserve
+  energy. The stronger FIM loss weight should make this information-seeking
+  behavior more visible during training.
 - Inference runtime should be more clearly attributable to the learned
   generator because FIM affects behavior through conditioning and training
   rather than through a separate candidate-ranking stage.

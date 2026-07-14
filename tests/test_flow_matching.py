@@ -46,9 +46,14 @@ def test_flow_matching_training_and_sampling_shape() -> None:
     model, history = train_flow_matching(dataset, config)
     assert len(history) == 1
     assert np.isfinite(history["loss"].iloc[-1])
+    assert np.isfinite(history["information_gain"].iloc[-1])
+    assert np.isfinite(history["speed_loss"].iloc[-1])
+    assert np.isfinite(history["step_loss"].iloc[-1])
+    assert np.isfinite(history["smoothness_loss"].iloc[-1])
 
     env.reset()
     condition = env.get_flow_condition_vector(coarse_action=env.greedy_action_toward_target())
+    assert condition.shape == (39,)
     samples = sample_trajectories(model, condition, num_samples=3, horizon=4, env=env, config=config)
 
     assert samples.shape == (3, 4, 3)

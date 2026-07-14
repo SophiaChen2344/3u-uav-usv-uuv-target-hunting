@@ -75,6 +75,12 @@ flow_matching:
   noise_scale: 18.0
   integration_steps: 20
   gradient_clip: 5.0
+  training_loss:
+    w_flow: 1.0
+    w_information_gain: 0.05
+    w_speed: 0.05
+    w_step: 0.05
+    w_smooth: 0.01
   scoring:
     w_hunt: 1.0
     w_energy: 0.001
@@ -111,6 +117,9 @@ sensing:
   observation_noise_uav: 20.0
   observation_noise_usv: 10.0
   observation_noise_uuv: 5.0
+  bearing_reference_range: 100.0
+  bearing_noise_scale: 1.0
+  bearing_noise_floor: 1.0e-4
   fim_regularization: 1.0e-6
   info_reward_weight: 0.01
   belief_update_alpha: 0.35

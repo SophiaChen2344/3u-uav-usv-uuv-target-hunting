@@ -1,10 +1,11 @@
-"""Conditional Flow Matching trajectory proposals for 3U target hunting.
+"""Information-aware Conditional Flow Matching trajectories for 3U hunting.
 
 The model in this file is intentionally lightweight. It learns a vector field
 that transports noisy short-horizon UUV-center trajectories toward synthetic
-expert trajectories conditioned on the current 3U state and diagnostics. At
-runtime it proposes smooth candidate trajectories; a separate cost function
-selects the safest low-cost candidate.
+expert trajectories conditioned on the current 3U state, target belief mean,
+target belief covariance, and diagnostics. During training it also rewards
+differentiable Fisher-information gain along predicted future trajectories.
+At runtime it still samples trajectories with a single vector-field rollout.
 """
 
 from __future__ import annotations
@@ -23,6 +24,14 @@ from torch.utils.data import DataLoader, TensorDataset
 from safety.lyapunov import is_safe_transition, lyapunov_value
 from utils.energy import uuv_group_step_energy
 from utils.physics import distance, safe_norm, safe_unit_vector
+
+
+UAV_SLICE = slice(0, 3)
+USV_SLICE = slice(3, 6)
+UUV_CENTER_SLICE = slice(6, 9)
+TARGET_MEAN_SLICE = slice(9, 12)
+TARGET_COVARIANCE_SLICE = slice(12, 18)
+CONDITION_DIM_WITH_COVARIANCE = 39
 
 
 @dataclass
@@ -220,7 +229,8 @@ def train_flow_matching(
     The synthetic dataset stores absolute future UUV-center positions. Noisy
     start trajectories are sampled around the current formation center stored in
     the condition vector, then linearly interpolated toward the target
-    trajectory.
+    trajectory. In addition to the base CFM velocity loss, the objective can
+    include differentiable Fisher-information gain and motion feasibility terms.
     """
 
     data = _load_dataset(dataset)
@@ -254,17 +264,34 @@ def train_flow_matching(
 
     epochs = int(cfg.get("epochs", 50))
     noise_scale = float(cfg.get("noise_scale", 18.0))
-    area_size = float(_env_config(config).get("area_size", 400.0))
-    depth = -abs(float(_env_config(config).get("initial_uuv_depth", 120.0)))
+    env_cfg = _env_config(config)
+    area_size = float(env_cfg.get("area_size", 400.0))
+    depth = -abs(float(env_cfg.get("initial_uuv_depth", 120.0)))
+    dt = float(env_cfg.get("dt", 1.0))
+    max_speed = float(env_cfg.get("uuv_speed", 8.0))
+    max_step = max_speed * max(dt, 1e-12)
+    loss_cfg = dict(cfg.get("training_loss", cfg.get("loss_weights", {})))
+    weights = {
+        "flow": float(loss_cfg.get("w_flow", 1.0)),
+        "information": float(loss_cfg.get("w_information_gain", 0.05)),
+        "speed": float(loss_cfg.get("w_speed", 0.05)),
+        "step": float(loss_cfg.get("w_step", 0.05)),
+        "smooth": float(loss_cfg.get("w_smooth", 0.01)),
+    }
 
     for epoch in range(epochs):
         epoch_losses = []
+        epoch_flow_losses = []
+        epoch_info_gains = []
+        epoch_speed_losses = []
+        epoch_step_losses = []
+        epoch_smooth_losses = []
         for condition_batch, target_batch in loader:
             condition_batch = condition_batch.to(device)
             target_batch = target_batch.to(device)
             batch_size = condition_batch.shape[0]
 
-            start_positions = condition_batch[:, 6:9].detach().cpu().numpy()
+            start_positions = condition_batch[:, UUV_CENTER_SLICE].detach().cpu().numpy()
             noise = np.stack(
                 [
                     _initial_noise_trajectories(
@@ -285,14 +312,52 @@ def train_flow_matching(
             target_velocity = target_batch - x0
 
             prediction = model(x_t, t, condition_batch)
-            loss = loss_fn(prediction, target_velocity)
+            predicted_flat = x0 + prediction
+            predicted_trajectory = predicted_flat.reshape(batch_size, trajectories.shape[1], 3)
+
+            flow_loss = loss_fn(prediction, target_velocity)
+            information_gain = _differentiable_trajectory_information_gain(
+                predicted_trajectory,
+                condition_batch,
+                config=config,
+            )
+            information_loss = -torch.mean(information_gain) / max(float(trajectories.shape[1]), 1.0)
+            speed_loss, step_loss, smooth_loss = _motion_regularization_losses(
+                predicted_trajectory,
+                condition_batch[:, UUV_CENTER_SLICE],
+                dt=dt,
+                max_speed=max_speed,
+                max_step=max_step,
+            )
+            loss = (
+                weights["flow"] * flow_loss
+                + weights["information"] * information_loss
+                + weights["speed"] * speed_loss
+                + weights["step"] * step_loss
+                + weights["smooth"] * smooth_loss
+            )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), float(cfg.get("gradient_clip", 5.0)))
             optimizer.step()
             epoch_losses.append(float(loss.item()))
+            epoch_flow_losses.append(float(flow_loss.item()))
+            epoch_info_gains.append(float(torch.mean(information_gain).detach().cpu().item()))
+            epoch_speed_losses.append(float(speed_loss.detach().cpu().item()))
+            epoch_step_losses.append(float(step_loss.detach().cpu().item()))
+            epoch_smooth_losses.append(float(smooth_loss.detach().cpu().item()))
 
-        records.append({"epoch": epoch, "loss": float(np.mean(epoch_losses)) if epoch_losses else np.nan})
+        records.append(
+            {
+                "epoch": epoch,
+                "loss": float(np.mean(epoch_losses)) if epoch_losses else np.nan,
+                "flow_loss": float(np.mean(epoch_flow_losses)) if epoch_flow_losses else np.nan,
+                "information_gain": float(np.mean(epoch_info_gains)) if epoch_info_gains else np.nan,
+                "speed_loss": float(np.mean(epoch_speed_losses)) if epoch_speed_losses else np.nan,
+                "step_loss": float(np.mean(epoch_step_losses)) if epoch_step_losses else np.nan,
+                "smoothness_loss": float(np.mean(epoch_smooth_losses)) if epoch_smooth_losses else np.nan,
+            }
+        )
 
     history = pd.DataFrame.from_records(records)
     checkpoint_path = cfg.get("checkpoint_path")
@@ -568,6 +633,113 @@ def trajectory_smoothness(trajectory: np.ndarray) -> float:
         return 0.0
     accelerations = trajectory[2:] - 2.0 * trajectory[1:-1] + trajectory[:-2]
     return float(np.mean(np.sum(accelerations**2, axis=1)))
+
+
+def _differentiable_trajectory_information_gain(
+    trajectory: torch.Tensor,
+    condition: torch.Tensor,
+    config: Dict[str, Any] | None = None,
+) -> torch.Tensor:
+    """Return differentiable log-det Fisher information gain for UUV waypoints."""
+
+    target_mean = _condition_target_mean(condition)
+    target_covariance = _condition_target_covariance(condition, config=config)
+    regularization = float((config or {}).get("sensing", {}).get("fim_regularization", 1e-6))
+    regularization = max(regularization, 1e-9)
+    eye = torch.eye(3, dtype=trajectory.dtype, device=trajectory.device).unsqueeze(0)
+    prior_covariance = target_covariance + regularization * eye
+    prior_precision = torch.linalg.pinv(prior_covariance)
+
+    delta = target_mean.unsqueeze(1) - trajectory
+    dx = delta[..., 0]
+    dy = delta[..., 1]
+    dz = delta[..., 2]
+    range_sq = torch.clamp(dx * dx + dy * dy + dz * dz, min=regularization)
+    range_norm = torch.sqrt(range_sq)
+    horizontal_sq = torch.clamp(dx * dx + dy * dy, min=regularization)
+
+    range_jacobian = delta / range_norm.unsqueeze(-1)
+    bearing_jacobian = torch.stack([-dy / horizontal_sq, dx / horizontal_sq, torch.zeros_like(dx)], dim=-1)
+
+    range_var, bearing_var = _uuv_range_bearing_variances(config, regularization=regularization)
+    range_term = torch.einsum("bhi,bhj->bhij", range_jacobian, range_jacobian) / range_var
+    bearing_term = torch.einsum("bhi,bhj->bhij", bearing_jacobian, bearing_jacobian) / bearing_var
+    trajectory_fim = torch.sum(range_term + bearing_term, dim=1)
+
+    posterior_precision = prior_precision + trajectory_fim + regularization * eye
+    prior_precision = prior_precision + regularization * eye
+    _prior_sign, prior_logdet = torch.linalg.slogdet(prior_precision)
+    _posterior_sign, posterior_logdet = torch.linalg.slogdet(posterior_precision)
+    gain = posterior_logdet - prior_logdet
+    return torch.nan_to_num(gain, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _motion_regularization_losses(
+    trajectory: torch.Tensor,
+    start_position: torch.Tensor,
+    dt: float,
+    max_speed: float,
+    max_step: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return speed, step-length, and smoothness penalties for generated paths."""
+
+    full_path = torch.cat([start_position.unsqueeze(1), trajectory], dim=1)
+    displacements = full_path[:, 1:, :] - full_path[:, :-1, :]
+    step_lengths = torch.linalg.norm(displacements, dim=-1)
+    speed = step_lengths / max(float(dt), 1e-12)
+    speed_loss = torch.mean(torch.relu(speed - float(max_speed)) ** 2)
+    step_loss = torch.mean(torch.relu(step_lengths - float(max_step)) ** 2)
+    if full_path.shape[1] < 3:
+        smooth_loss = torch.zeros((), dtype=trajectory.dtype, device=trajectory.device)
+    else:
+        accelerations = full_path[:, 2:, :] - 2.0 * full_path[:, 1:-1, :] + full_path[:, :-2, :]
+        smooth_loss = torch.mean(torch.sum(accelerations**2, dim=-1)) / max(float(max_step) ** 2, 1e-12)
+    return speed_loss, step_loss, smooth_loss
+
+
+def _uuv_range_bearing_variances(
+    config: Dict[str, Any] | None = None,
+    regularization: float = 1e-9,
+) -> tuple[float, float]:
+    """Return UUV range and bearing variances matching the environment sensor model."""
+
+    sensing_cfg = dict((config or {}).get("sensing", {}))
+    env_cfg = _env_config(config or {})
+    range_std = max(float(sensing_cfg.get("observation_noise_uuv", 5.0)), regularization)
+    default_reference = 0.25 * float(env_cfg.get("area_size", 400.0))
+    reference_range = max(float(sensing_cfg.get("bearing_reference_range", default_reference)), 1.0)
+    bearing_scale = max(float(sensing_cfg.get("bearing_noise_scale", 1.0)), 0.0)
+    bearing_floor = max(float(sensing_cfg.get("bearing_noise_floor", 1e-4)), regularization)
+    bearing_std = max(bearing_floor, bearing_scale * range_std / reference_range)
+    return max(range_std**2, regularization), max(bearing_std**2, regularization)
+
+
+def _condition_target_mean(condition: torch.Tensor) -> torch.Tensor:
+    if condition.shape[1] >= TARGET_MEAN_SLICE.stop:
+        return condition[:, TARGET_MEAN_SLICE]
+    return torch.zeros((condition.shape[0], 3), dtype=condition.dtype, device=condition.device)
+
+
+def _condition_target_covariance(condition: torch.Tensor, config: Dict[str, Any] | None = None) -> torch.Tensor:
+    batch_size = condition.shape[0]
+    eye = torch.eye(3, dtype=condition.dtype, device=condition.device).unsqueeze(0).repeat(batch_size, 1, 1)
+    if condition.shape[1] < CONDITION_DIM_WITH_COVARIANCE:
+        noise = float((config or {}).get("sensing", {}).get("observation_noise_uuv", 5.0))
+        return eye * max(noise**2, 1e-6)
+
+    entries = condition[:, TARGET_COVARIANCE_SLICE]
+    covariance = torch.zeros((batch_size, 3, 3), dtype=condition.dtype, device=condition.device)
+    covariance[:, 0, 0] = torch.clamp(entries[:, 0], min=1e-6)
+    covariance[:, 1, 1] = torch.clamp(entries[:, 1], min=1e-6)
+    covariance[:, 2, 2] = torch.clamp(entries[:, 2], min=1e-6)
+    covariance[:, 0, 1] = entries[:, 3]
+    covariance[:, 1, 0] = entries[:, 3]
+    covariance[:, 0, 2] = entries[:, 4]
+    covariance[:, 2, 0] = entries[:, 4]
+    covariance[:, 1, 2] = entries[:, 5]
+    covariance[:, 2, 1] = entries[:, 5]
+    covariance = 0.5 * (covariance + covariance.transpose(1, 2))
+    return covariance + 1e-6 * eye
 
 
 class FlowMatchingPlanner:

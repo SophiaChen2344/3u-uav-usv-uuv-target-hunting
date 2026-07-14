@@ -43,6 +43,7 @@ class ThreeUState:
     energy_budget: float
     observed_target_position: np.ndarray | None = None
     belief_target_position: np.ndarray | None = None
+    belief_target_covariance: np.ndarray | None = None
     target_escaped: bool = False
     constraint_violation: bool = False
 
@@ -211,6 +212,7 @@ class ThreeUEnv:
             energy_budget=self.energy_budget,
             observed_target_position=target_position.copy(),
             belief_target_position=target_position.copy(),
+            belief_target_covariance=np.eye(3, dtype=float),
         )
         self._update_sensing(initial=True)
         self.history = {
@@ -229,6 +231,7 @@ class ThreeUEnv:
             "belief_error": [],
             "target_true_position": [],
             "target_belief_position": [],
+            "target_belief_covariance": [],
             "lyapunov_value": [],
             "lyapunov_delta": [],
             "lyapunov_condition_satisfied": [],
@@ -495,6 +498,7 @@ class ThreeUEnv:
         connectivity = self.get_connectivity_metrics()
         fim = self.compute_fim_metrics()
         target_response = self.predict_target_best_response()
+        belief_covariance = self._belief_target_covariance()
         last_step_energy = float(self.history["energy"][-1]) if self.history.get("energy") else 0.0
         remaining_mean = float(np.mean(self.state.uuv_energy))
         budget = max(float(self.energy_budget), 1e-9)
@@ -503,6 +507,7 @@ class ThreeUEnv:
             "usv_position": self.state.usv_position.copy(),
             "uuv_center": self.state.uuv_center.copy(),
             "target_belief_position": self._belief_target_position().copy(),
+            "target_belief_covariance": self._covariance_features(belief_covariance),
             "target_belief_velocity": target_response.copy(),
             "total_voyage_distance": float(self.state.total_voyage_distance),
             "energy_metrics": np.array(
@@ -537,6 +542,7 @@ class ThreeUEnv:
                 condition["usv_position"],
                 condition["uuv_center"],
                 condition["target_belief_position"],
+                condition["target_belief_covariance"],
                 condition["target_belief_velocity"],
                 np.array([condition["total_voyage_distance"]], dtype=float),
                 condition["energy_metrics"],
@@ -652,6 +658,7 @@ class ThreeUEnv:
         self.history["belief_error"].append(float(self.current_belief_error))
         self.history["target_true_position"].append(self.state.target_position.copy())
         self.history["target_belief_position"].append(self._belief_target_position().copy())
+        self.history["target_belief_covariance"].append(self._belief_target_covariance().copy())
         game_info = self._last_game_step_info or self._default_game_info()
         self.history["target_best_response_action"].append(float(game_info.get("target_best_response_action", -1.0)))
         self.history["stackelberg_selected_action"].append(float(game_info.get("stackelberg_selected_action", -1.0)))
@@ -666,6 +673,7 @@ class ThreeUEnv:
         sg_distance = self._sg_distance()
         target_distance = self._target_distance()
         belief_position = self._belief_target_position()
+        belief_covariance = self._belief_target_covariance()
         observed_position = self._observed_target_position()
         connected_fraction = 0.5 * float(us_distance <= self.uav_usv_range) + 0.5 * float(
             sg_distance <= self.usv_uuv_range
@@ -708,6 +716,7 @@ class ThreeUEnv:
             "belief_error": float(self.current_belief_error),
             "target_true_position": self.state.target_position.copy(),
             "target_belief_position": belief_position.copy(),
+            "target_belief_covariance": belief_covariance.copy(),
             "target_observed_position": observed_position.copy(),
             "target_true_x": float(self.state.target_position[0]),
             "target_true_y": float(self.state.target_position[1]),
@@ -715,6 +724,10 @@ class ThreeUEnv:
             "target_belief_x": float(belief_position[0]),
             "target_belief_y": float(belief_position[1]),
             "target_belief_z": float(belief_position[2]),
+            "target_belief_cov_xx": float(belief_covariance[0, 0]),
+            "target_belief_cov_yy": float(belief_covariance[1, 1]),
+            "target_belief_cov_zz": float(belief_covariance[2, 2]),
+            "target_belief_cov_xy": float(belief_covariance[0, 1]),
             "target_observed_x": float(observed_position[0]),
             "target_observed_y": float(observed_position[1]),
             "target_observed_z": float(observed_position[2]),
@@ -734,20 +747,26 @@ class ThreeUEnv:
         true_target = self.state.target_position.copy()
 
         if self.use_belief_state:
-            fused_observation = self._fused_noisy_position_observation(true_target)
+            fused_observation, observation_covariance = self._fused_noisy_position_observation(true_target)
             previous_belief = self._belief_target_position()
+            previous_covariance = self._belief_target_covariance()
             if initial:
                 belief = fused_observation
+                belief_covariance = observation_covariance
             else:
                 alpha = float(np.clip(self.belief_update_alpha, 0.0, 1.0))
                 belief = alpha * previous_belief + (1.0 - alpha) * fused_observation
+                belief_covariance = alpha**2 * previous_covariance + (1.0 - alpha) ** 2 * observation_covariance
             belief = self._clip_target_belief(belief)
+            belief_covariance = self._regularize_covariance(belief_covariance)
         else:
             fused_observation = true_target.copy()
             belief = true_target.copy()
+            belief_covariance = self._regularize_covariance(np.eye(3, dtype=float) * self.fim_regularization)
 
         self.state.observed_target_position = fused_observation.copy()
         self.state.belief_target_position = belief.copy()
+        self.state.belief_target_covariance = belief_covariance.copy()
         self.current_belief_error = self._distance(true_target, belief)
 
         if self.use_fim:
@@ -761,21 +780,25 @@ class ThreeUEnv:
             self.current_fim_metrics = self._empty_fim_metrics()
             self.current_normalized_logdet = 0.0
 
-    def _fused_noisy_position_observation(self, true_target: np.ndarray) -> np.ndarray:
+    def _fused_noisy_position_observation(self, true_target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         estimates = []
-        variances = []
+        covariances = []
 
         for sensor_position, noise_std in self._target_sensor_specs(true_target):
             estimates.append(self._range_bearing_position_observation(true_target, sensor_position, noise_std))
-            covariance = self._range_bearing_covariance(true_target, sensor_position, noise_std)
-            variances.append(max(float(np.trace(covariance)), 1e-9))
+            covariances.append(self._range_bearing_position_covariance(true_target, sensor_position, noise_std))
 
-        weights = 1.0 / np.asarray(variances, dtype=float)
-        weights = weights / max(float(np.sum(weights)), 1e-12)
-        fused = np.zeros(3, dtype=float)
-        for weight, estimate in zip(weights, estimates):
-            fused += float(weight) * estimate
-        return self._clip_target_belief(fused)
+        information = np.zeros((3, 3), dtype=float)
+        weighted_mean = np.zeros(3, dtype=float)
+        for estimate, covariance in zip(estimates, covariances):
+            regularized = self._regularize_covariance(covariance)
+            precision = np.linalg.pinv(regularized)
+            information += precision
+            weighted_mean += precision @ estimate
+
+        fused_covariance = self._regularize_covariance(np.linalg.pinv(information))
+        fused = fused_covariance @ weighted_mean
+        return self._clip_target_belief(fused), fused_covariance
 
     def _range_bearing_position_observation(
         self,
@@ -832,9 +855,40 @@ class ThreeUEnv:
 
     def _range_bearing_covariance(self, target: np.ndarray, sensor: np.ndarray, position_noise_std: float) -> np.ndarray:
         std = max(float(position_noise_std), 1e-9)
-        horizontal_distance = max(float(np.linalg.norm(target[:2] - sensor[:2])), 1.0)
-        bearing_std = std / horizontal_distance
+        reference_range = max(float(self.sensing_config.get("bearing_reference_range", 0.25 * self.area_size)), 1.0)
+        bearing_scale = max(float(self.sensing_config.get("bearing_noise_scale", 1.0)), 0.0)
+        bearing_floor = max(float(self.sensing_config.get("bearing_noise_floor", 1e-4)), 1e-9)
+        bearing_std = max(bearing_floor, bearing_scale * std / reference_range)
         return np.diag([std**2, bearing_std**2]).astype(float)
+
+    def _range_bearing_position_covariance(
+        self,
+        target: np.ndarray,
+        sensor: np.ndarray,
+        position_noise_std: float,
+    ) -> np.ndarray:
+        covariance = self._range_bearing_covariance(target, sensor, position_noise_std)
+        delta_xy = np.asarray(target[:2] - sensor[:2], dtype=float)
+        horizontal_distance = max(float(np.linalg.norm(delta_xy)), 1.0)
+        radial = delta_xy / horizontal_distance
+        tangent = np.array([-radial[1], radial[0]], dtype=float)
+        radial_var = float(covariance[0, 0])
+        tangent_var = float(covariance[1, 1]) * horizontal_distance**2
+        xy_cov = radial_var * np.outer(radial, radial) + tangent_var * np.outer(tangent, tangent)
+        depth_std = float(self.sensing_config.get("target_depth_std", max(1.0, 0.25 * position_noise_std)))
+        position_covariance = np.zeros((3, 3), dtype=float)
+        position_covariance[:2, :2] = xy_cov
+        position_covariance[2, 2] = depth_std**2
+        return self._regularize_covariance(position_covariance)
+
+    def _regularize_covariance(self, covariance: np.ndarray) -> np.ndarray:
+        matrix = np.asarray(covariance, dtype=float)
+        if matrix.shape != (3, 3):
+            matrix = np.eye(3, dtype=float) * max(float(self.fim_regularization), 1e-9)
+        matrix = 0.5 * (matrix + matrix.T)
+        floor = max(float(self.fim_regularization), 1e-9)
+        matrix += floor * np.eye(3, dtype=float)
+        return np.nan_to_num(matrix, nan=floor, posinf=1.0 / floor, neginf=floor)
 
     def _information_reward(self) -> float:
         if not self.use_fim:
@@ -858,6 +912,18 @@ class ThreeUEnv:
         if self.state.belief_target_position is None:
             return self.state.target_position
         return self.state.belief_target_position
+
+    def _belief_target_covariance(self) -> np.ndarray:
+        if self.state.belief_target_covariance is None:
+            return self._regularize_covariance(np.eye(3, dtype=float))
+        return self._regularize_covariance(self.state.belief_target_covariance)
+
+    def _covariance_features(self, covariance: np.ndarray) -> np.ndarray:
+        matrix = self._regularize_covariance(covariance)
+        return np.array(
+            [matrix[0, 0], matrix[1, 1], matrix[2, 2], matrix[0, 1], matrix[0, 2], matrix[1, 2]],
+            dtype=float,
+        )
 
     def _observed_target_position(self) -> np.ndarray:
         if self.state.observed_target_position is None:

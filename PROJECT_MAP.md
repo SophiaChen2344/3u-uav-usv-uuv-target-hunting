@@ -14,8 +14,9 @@ methods, safety/sensing/game extensions, and reproducible experiments.
 
 - `src/agents/` contains DQN-family agents and the ACO baseline planner.
 - `src/models/` contains neural network modules used by the agents.
-- `src/generative/` contains the Conditional Flow Matching formation-center
-  trajectory generator and synthetic trajectory dataset builder.
+- `src/generative/` contains the information-aware Conditional Flow Matching
+  formation-center trajectory generator and synthetic trajectory dataset
+  builder.
 
 ## Safety, Sensing, And Game Layers
 

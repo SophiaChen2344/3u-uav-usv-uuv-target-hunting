@@ -70,6 +70,8 @@ def test_environment_runs_with_fim_disabled_and_enabled() -> None:
     assert np.isnan(info_disabled["fim_logdet"])
     assert np.isfinite(info_enabled["fim_logdet"])
     assert np.isfinite(info_enabled["belief_error"])
+    assert info_enabled["target_belief_covariance"].shape == (3, 3)
+    assert np.all(np.linalg.eigvalsh(info_enabled["target_belief_covariance"]) > 0.0)
 
 
 def test_belief_state_hides_true_target_position_from_policy_state() -> None:
@@ -86,6 +88,9 @@ def test_belief_state_hides_true_target_position_from_policy_state() -> None:
     policy_target = observation[9:12]
     true_target = env.state.target_position.astype(np.float32)
     belief_target = env.state.belief_target_position.astype(np.float32)
+    condition = env.get_flow_condition_vector(coarse_action=env.greedy_action_toward_target())
 
     assert np.allclose(policy_target, belief_target)
     assert not np.allclose(policy_target, true_target)
+    assert condition.shape == (39,)
+    assert np.all(condition[12:15] > 0.0)

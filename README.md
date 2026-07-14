@@ -9,8 +9,9 @@ Fig. 2-like, Fig. 3-like, and Table II-like comparisons.
 The current version also includes noisy target sensing with Fisher Information
 Matrix (FIM) diagnostics, a one-step Stackelberg pursuit-evasion game for
 rational target motion, a Lyapunov-inspired safety filter, and a lightweight
-Conditional Flow Matching trajectory proposal module. These additions are
-educational approximations, not formal proofs or official paper code.
+information-aware Conditional Flow Matching trajectory generator. These
+additions are educational approximations, not formal proofs or official paper
+code.
 
 For a quick navigation guide, see [PROJECT_MAP.md](PROJECT_MAP.md).
 
@@ -43,9 +44,11 @@ reproduction-style simulation results, not as exact paper results.
   optional acoustic communication term.
 - Connectivity model: UAV-USV connectivity and underwater USV-UUV graph
   connectivity are approximated from distances.
-- Sensing and belief model: UAV, USV, and UUV-center observations are noisy,
-  and planners/agents use a fused target-position belief instead of the true
-  target position when belief state is enabled.
+- Sensing and belief model: UAV, USV, and UUV-center observations use the same
+  Gaussian range-bearing noise model, and planners/agents use a fused
+  target-position belief mean and covariance instead of the true target
+  position when belief state is enabled. The covariance preserves directional
+  uncertainty from range and bearing geometry.
 - Fisher Information Matrix: A range-bearing FIM estimates how informative the
   current platform geometry is for 3D target-position estimation.
 - Stackelberg pursuit-evasion game: The trajectory generator supplies the UUV
@@ -54,10 +57,13 @@ reproduction-style simulation results, not as exact paper results.
 - Lyapunov-inspired safety filter: Candidate UUV actions are screened only for
   safety risks such as boundary violation, relay-chain breakage, and low
   remaining energy. It does not include a target-distance tracking term.
-- Conditional Flow Matching: A small MLP vector field generates smooth
-  short-horizon formation-center trajectories as the integrated planner's
-  primary trajectory generator, conditioned on state, target belief, energy,
-  connectivity, FIM, and predicted target response metrics.
+- Information-aware Conditional Flow Matching: A small MLP vector field
+  generates smooth short-horizon formation-center trajectories as the
+  integrated planner's primary trajectory generator. It is conditioned on the
+  target belief mean and covariance, so the model sees both where the target is
+  likely to be and which uncertainty directions need information. Training adds
+  differentiable FIM information gain plus speed, step-length, and smoothness
+  penalties to the base Flow Matching loss.
 - DQN / Double DQN / Dueling DQN: PyTorch agents learn UUV formation-center
   trajectory decisions.
 - ACO baseline: A grid-based Ant Colony Optimization planner provides a
@@ -290,15 +296,19 @@ results/datasets/
   links unless that abstraction is explicitly extended.
 - The USV movement and target escape behavior are simplified.
 - The sensing model uses a compact Gaussian range-bearing approximation rather
-  than a calibrated physical sensor stack.
-- The UUV team belief state is a fused target-position estimate, not a full
-  Bayesian multi-target tracker.
+  than a calibrated physical sensor stack; the same range and bearing variances
+  feed target observations, belief covariance, FIM diagnostics, and
+  Flow Matching's differentiable information-gain loss.
+- The UUV team belief state is a fused target-position mean and covariance, not
+  a full Bayesian multi-target tracker.
 - The Stackelberg game is a one-step discrete best-response approximation; it
   is designed to test the pursuit-evasion idea without making DQN training
   prohibitively slow.
 - The Flow Matching generator is trained on synthetic trajectories from DQN
   rollouts, ACO-style paths, heuristic pursuit, and safety-filtered simulator
-  rollouts because no official expert trajectory dataset is available.
+  rollouts because no official expert trajectory dataset is available. Its
+  training objective also rewards predicted trajectories that increase Fisher
+  information and penalizes dynamically awkward motion.
 - Flow Matching is the default integrated trajectory generator. DQN-family
   agents remain available as baselines or coarse-action conditioners.
 - Exact numerical results may differ from the paper.

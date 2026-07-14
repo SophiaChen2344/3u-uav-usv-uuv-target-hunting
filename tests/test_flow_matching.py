@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import torch
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -12,7 +13,12 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from envs.three_u_env import ThreeUEnv
-from generative.flow_matching import FlowMatchingPlanner, sample_trajectories, train_flow_matching
+from generative.flow_matching import (
+    FlowMatchingPlanner,
+    _differentiable_trajectory_information_gain,
+    sample_trajectories,
+    train_flow_matching,
+)
 from generative.trajectory_dataset import generate_heuristic_trajectories
 
 
@@ -62,6 +68,26 @@ def test_flow_matching_training_and_sampling_shape() -> None:
     assert np.all(samples[:, :, 1] >= 0.0)
     assert np.all(samples[:, :, 1] <= env.area_size)
     assert np.allclose(samples[:, :, 2], env.uuv_initial_depth)
+
+
+def test_differentiable_fim_uses_heterogeneous_sensors_with_smooth_range() -> None:
+    config = load_flow_test_config()
+    config["sensing"]["uuv_observation_range"] = 1.0
+    config["sensing"]["observation_range_smoothing"] = 5.0
+    env = ThreeUEnv(config, seed=432)
+    env.reset()
+    condition = env.get_flow_condition_vector(coarse_action=env.greedy_action_toward_target())
+    trajectory = np.repeat(env.state.uuv_center[None, :], repeats=4, axis=0).astype(np.float32)
+
+    gain = _differentiable_trajectory_information_gain(
+        torch.as_tensor(trajectory[None, :, :], dtype=torch.float32),
+        torch.as_tensor(condition[None, :], dtype=torch.float32),
+        config=config,
+    )
+
+    assert gain.shape == (1,)
+    assert torch.isfinite(gain).all()
+    assert float(gain.item()) > 0.0
 
 
 def test_full_flow_matching_planner_runs_five_steps() -> None:

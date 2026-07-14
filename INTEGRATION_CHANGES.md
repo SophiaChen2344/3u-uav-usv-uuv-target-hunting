@@ -11,9 +11,15 @@ responsibilities.
   generation on the target belief mean, target belief covariance, FIM
   diagnostics, energy, connectivity, and predicted target response terms.
 - Flow Matching training is now information-aware. The model's predicted future
-  trajectory is used to compute differentiable Fisher-information gain, which
-  is optimized together with the base Flow Matching velocity loss plus speed,
+  trajectory is used with UAV, USV, and UUV range-bearing observations to
+  compute differentiable heterogeneous Fisher-information gain, which is
+  optimized together with the base Flow Matching velocity loss plus speed,
   step-length, and smoothness penalties.
+- The differentiable FIM now uses smooth sigmoid observation-range gates, so
+  sensor influence fades near UAV, USV, and UUV range limits instead of
+  switching on or off discontinuously.
+- The Flow Matching information-gain loss weight was increased so the FIM term
+  is less likely to be drowned out by the base velocity-matching loss.
 - Flow Matching inference now follows the learned generator directly. It
   samples one primary trajectory and converts that trajectory to the UUV
   formation-center action without using runtime FIM candidate filtering or
@@ -60,7 +66,9 @@ responsibilities.
   because they are derived from a common sensor model.
 - Training should prefer trajectories that reduce target localization
   uncertainty along poorly estimated directions, while still discouraging
-  excessive speed, step length, and nonsmooth motion.
+  excessive speed, step length, and nonsmooth motion. The stronger FIM loss
+  weight should make this information-seeking behavior more visible during
+  training.
 - Inference runtime should be more clearly attributable to the learned
   generator because FIM affects behavior through conditioning and training
   rather than through a separate candidate-ranking stage.
@@ -76,7 +84,7 @@ responsibilities.
   expected CRLF line-ending warnings on Windows.
 - Python 3.12.10 was installed through `winget`, dependencies from
   `requirements.txt` were installed, and `python -m pytest` passed with
-  16 tests.
+  17 tests.
 - A short Flow Matching training smoke test also passed with a 12-sample
-  heuristic dataset, one training epoch, one generated trajectory, and direct
-  planner inference.
+  heuristic dataset, one training epoch, heterogeneous FIM information gain
+  weight `0.2`, one generated trajectory, and direct planner inference.

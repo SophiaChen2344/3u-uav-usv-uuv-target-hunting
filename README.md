@@ -62,12 +62,14 @@ reproduction-style simulation results, not as exact paper results.
   integrated planner's primary trajectory generator. It is conditioned on the
   target belief mean and covariance, so the model sees both where the target is
   likely to be and which uncertainty directions need information. Training adds
-  differentiable heterogeneous FIM information gain from UAV, USV, and UUV
-  range-bearing observations plus speed, step-length, and smoothness penalties
-  to the base Flow Matching loss. Smooth observation-range gates make the
-  information gain differentiable near sensor range limits. At inference time
-  the planner uses one generated primary trajectory directly, without online
-  FIM candidate filtering or trajectory optimization.
+  differentiable heterogeneous FIM information gain from the current UAV/USV
+  positions and the predicted UUV formation-center waypoints, all using the
+  shared range-bearing observation model. Smooth sigmoid observation-range
+  gates make sensor influence differentiable near range limits. The default
+  information-gain weight is raised to `0.2`, and the objective also includes
+  speed, step-length, and smoothness penalties. At inference time the planner
+  uses one generated primary trajectory directly, without online FIM candidate
+  filtering or trajectory optimization.
 - DQN / Double DQN / Dueling DQN: PyTorch agents learn UUV formation-center
   trajectory decisions.
 - ACO baseline: A grid-based Ant Colony Optimization planner provides a
@@ -302,7 +304,7 @@ results/datasets/
 - The sensing model uses a compact Gaussian range-bearing approximation rather
   than a calibrated physical sensor stack; the same range and bearing variances
   feed target observations, belief covariance, FIM diagnostics, and
-  Flow Matching's differentiable information-gain loss.
+  Flow Matching's differentiable heterogeneous information-gain loss.
 - The UUV team belief state is a fused target-position mean and covariance, not
   a full Bayesian multi-target tracker.
 - The Stackelberg game is a one-step discrete best-response approximation; it
@@ -312,8 +314,8 @@ results/datasets/
   rollouts, ACO-style paths, heuristic pursuit, and safety-filtered simulator
   rollouts because no official expert trajectory dataset is available. Its
   training objective also gives a stronger weight to predicted trajectories
-  that increase heterogeneous Fisher information and penalizes dynamically
-  awkward motion.
+  that increase heterogeneous Fisher information from UAV, USV, and predicted
+  UUV sensing geometry, while penalizing dynamically awkward motion.
 - Flow Matching is the default integrated trajectory generator. DQN-family
   policies remain available as baselines or coarse-action conditioners.
 - Flow Matching checkpoints trained before target-belief covariance was added

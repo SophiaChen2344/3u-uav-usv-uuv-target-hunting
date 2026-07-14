@@ -10,16 +10,19 @@ responsibilities.
   The default planner mode is `full`, and Flow Matching conditions trajectory
   generation on the target belief mean, target belief covariance, FIM
   diagnostics, energy, connectivity, and predicted target response terms.
-- Flow Matching training is now information-aware. The model's predicted future
-  trajectory is used with UAV, USV, and UUV range-bearing observations to
-  compute differentiable heterogeneous Fisher-information gain, which is
-  optimized together with the base Flow Matching velocity loss plus speed,
-  step-length, and smoothness penalties.
+- Flow Matching training is now information-aware. The model's predicted UUV
+  formation-center trajectory is combined with the current UAV and USV
+  positions from the condition vector to compute differentiable heterogeneous
+  Fisher-information gain, which is optimized together with the base Flow
+  Matching velocity loss plus speed, step-length, and smoothness penalties.
 - The differentiable FIM now uses smooth sigmoid observation-range gates, so
   sensor influence fades near UAV, USV, and UUV range limits instead of
-  switching on or off discontinuously.
+  switching on or off discontinuously. The default ranges are 600 m for UAV,
+  400 m for USV, and 130 m for the UUV formation center, with a 20 m smoothing
+  width.
 - The Flow Matching information-gain loss weight was increased so the FIM term
-  is less likely to be drowned out by the base velocity-matching loss.
+  is less likely to be drowned out by the base velocity-matching loss. The
+  default `w_information_gain` is now `0.2`.
 - Flow Matching inference now follows the learned generator directly. It
   samples one primary trajectory and converts that trajectory to the UUV
   formation-center action without using runtime FIM candidate filtering or
@@ -31,9 +34,9 @@ responsibilities.
   Its score excludes target-distance pursuit terms and only reacts to boundary
   risk, communication-chain risk, and low-energy risk.
 - Target observation, belief update, FIM diagnostics, and Flow Matching's
-  differentiable information-gain loss now share the same range-bearing noise
-  model. This removes the earlier mismatch between Cartesian noisy observations
-  and range-bearing FIM calculations.
+  differentiable heterogeneous information-gain loss now share the same
+  range-bearing noise model. This removes the earlier mismatch between
+  Cartesian noisy observations and range-bearing FIM calculations.
 - Target belief covariance is propagated with the fused observation and exposed
   as a condition input, so the generator can react to anisotropic target
   uncertainty instead of relying on target mean alone. The covariance is built

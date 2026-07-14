@@ -16,7 +16,7 @@ methods, safety/sensing/game extensions, and reproducible experiments.
 - `src/models/` contains neural network modules used by the agents.
 - `src/generative/` contains the information-aware Conditional Flow Matching
   formation-center trajectory generator and synthetic trajectory dataset
-  builder.
+  builder, including the heterogeneous differentiable FIM training signal.
 
 ## Safety, Sensing, And Game Layers
 
